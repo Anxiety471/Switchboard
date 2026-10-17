@@ -1,8 +1,10 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Pool, type PoolClient } from 'pg';
+import { fileURLToPath } from 'node:url';
+import { Client, Pool, type PoolClient } from 'pg';
 import { expect, test } from 'vitest';
+import { buildApp } from './app.js';
 import { migrate } from './migrate.js';
 import { assertTestDatabaseUrl } from './test-helpers/test-database.js';
 
@@ -72,3 +74,82 @@ test('a slow migration statement is not cancelled', async () => {
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test('an upgrade renames case-variant agent names before the unique index', async () => {
+  const caseUrl = databaseUrlFor('switchboard_case_test');
+  const admin = new Client({ connectionString: databaseUrl });
+  await admin.connect();
+  await admin.query(
+    'DROP DATABASE IF EXISTS switchboard_case_test WITH (FORCE)',
+  );
+  await admin.query('CREATE DATABASE switchboard_case_test');
+  const setup = new Client({ connectionString: caseUrl });
+  const pool = new Pool({ connectionString: caseUrl, max: 1 });
+  setup.on('error', () => undefined);
+  pool.on('error', () => undefined);
+  let app: ReturnType<typeof buildApp> | undefined;
+  try {
+    await setup.connect();
+    await setup.query(
+      await readFile(
+        fileURLToPath(new URL('./migrations/001_init.sql', import.meta.url)),
+        'utf8',
+      ),
+    );
+    await setup.query(
+      `INSERT INTO agents (name, token_hash, created_at)
+       VALUES
+         ('Alpha', decode(repeat('11', 32), 'hex'), timestamptz '2020-01-01'),
+         ('alpha', decode(repeat('22', 32), 'hex'), timestamptz '2020-01-02')`,
+    );
+    await setup.query(`
+      CREATE TABLE schema_migrations (
+        version text PRIMARY KEY,
+        applied_at timestamptz NOT NULL DEFAULT clock_timestamp()
+      )
+    `);
+    await setup.query(`INSERT INTO schema_migrations (version) VALUES ($1)`, [
+      '001_init.sql',
+    ]);
+    const before = await setup.query<{ id: string; name: string }>(
+      'SELECT id, name FROM agents ORDER BY created_at, id',
+    );
+
+    await migrate(pool);
+    app = buildApp(caseUrl);
+
+    const after = await setup.query<{ id: string; name: string }>(
+      'SELECT id, name FROM agents ORDER BY created_at, id',
+    );
+    expect(after.rows.map((row) => row.id)).toEqual(
+      before.rows.map((row) => row.id),
+    );
+    expect(after.rows.map((row) => row.name)).toEqual(['Alpha', 'alpha_2']);
+    const index = await setup.query(
+      `SELECT 1
+       FROM pg_indexes
+       WHERE schemaname = 'public'
+         AND indexname = 'agents_name_lower_idx'`,
+    );
+    expect(index.rowCount).toBe(1);
+
+    await app.migrationsReady;
+    const health = await app.inject({ method: 'GET', url: '/health' });
+    expect(health.statusCode).toBe(200);
+    expect(health.body).toBe('{"ok":true}');
+  } finally {
+    await app?.close();
+    await setup.end().catch(() => undefined);
+    await pool.end();
+    await admin.query(
+      'DROP DATABASE IF EXISTS switchboard_case_test WITH (FORCE)',
+    );
+    await admin.end();
+  }
+});
+
+function databaseUrlFor(name: string): string {
+  const url = new URL(databaseUrl);
+  url.pathname = `/${name}`;
+  return url.toString();
+}
