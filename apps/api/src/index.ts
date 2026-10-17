@@ -1,4 +1,4 @@
-import { buildApp, parsePort } from './app.js';
+import { buildApp, parseHost, parsePort } from './app.js';
 
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) {
@@ -6,9 +6,15 @@ if (!databaseUrl) {
 }
 
 const port = parsePort(process.env.PORT);
-const app = buildApp(databaseUrl, { logger: true });
+const registrationSecret = process.env.REGISTRATION_SECRET;
+const app = buildApp(databaseUrl, {
+  logger: true,
+  ...(registrationSecret !== undefined && registrationSecret !== ''
+    ? { registrationSecret }
+    : {}),
+});
 
-await app.listen({ host: '0.0.0.0', port });
+await app.listen({ host: parseHost(process.env.HOST), port });
 
 let shuttingDown = false;
 
@@ -19,6 +25,7 @@ function shutdown(signal: NodeJS.Signals): void {
   shuttingDown = true;
   app.log.info({ signal }, 'shutting down');
   const forceExit = setTimeout(() => {
+    app.log.error('shutdown timed out; forcing exit');
     process.exit(1);
   }, 5000);
   forceExit.unref();
