@@ -17,6 +17,7 @@ beforeEach(() => {
   process.env.DASHBOARD_SECRET = SECRET;
   process.env.SWITCHBOARD_URL = 'http://127.0.0.1:9';
   delete process.env.COOKIE_SECURE;
+  delete process.env.TRUST_PROXY;
 });
 
 function request(
@@ -204,4 +205,69 @@ test('POST /desk rejects a foreign origin, a missing csrf token, and a control c
     ),
   );
   expect(carriage.status).toBe(400);
+});
+
+test('login limits follow the socket unless TRUST_PROXY is set, and a correct key still signs in', async () => {
+  const server = await listen((incoming, response) => {
+    const secret = incoming.headers['x-dashboard-secret'];
+    if (secret !== SECRET) {
+      response.writeHead(401).end('{}');
+      return;
+    }
+    if (incoming.url === '/dashboard/sessions' && incoming.method === 'POST') {
+      response.writeHead(201, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ id: SESSION_ID, csrfToken: CSRF }));
+      return;
+    }
+    response.writeHead(404).end('{}');
+  });
+  process.env.SWITCHBOARD_URL = server.url;
+  try {
+    const csrf = issueFormCsrf(SECRET);
+    const attempt = (password: string, address: string, forwarded: string) => {
+      const incoming = request(
+        { intent: 'login', password, csrf },
+        originHeaders({ 'x-forwarded-for': forwarded }),
+      );
+      Object.defineProperty(incoming, 'socket', {
+        value: { remoteAddress: address },
+      });
+      return POST(incoming);
+    };
+
+    for (let count = 0; count < 8; count += 1) {
+      const denied = await attempt('nope', '203.0.113.10', '198.51.100.1');
+      expect(denied.status).toBe(303);
+      expect(denied.headers.get('location')).toBe('/?error=unauthorized');
+    }
+    const spoofed = await attempt('nope', '203.0.113.10', '198.51.100.2');
+    expect(spoofed.status).toBe(429);
+
+    const otherClient = await attempt('nope', '203.0.113.20', '198.51.100.2');
+    expect(otherClient.status).toBe(303);
+    expect(otherClient.headers.get('location')).toBe('/?error=unauthorized');
+
+    const correct = await attempt(SECRET, '203.0.113.10', '198.51.100.9');
+    expect(correct.status).toBe(303);
+    expect(correct.headers.get('location')).toBe('/');
+    expect(correct.headers.get('set-cookie')).toContain(
+      `switchboard_desk=${SESSION_ID}`,
+    );
+
+    for (let count = 0; count < 8; count += 1) {
+      expect(
+        (await attempt('nope', '203.0.113.30', '198.51.100.1')).status,
+      ).toBe(303);
+    }
+    expect((await attempt('nope', '203.0.113.30', '198.51.100.8')).status).toBe(
+      429,
+    );
+    process.env.TRUST_PROXY = '1';
+    const forwarded = await attempt('nope', '203.0.113.30', '198.51.100.8');
+    expect(forwarded.status).toBe(303);
+    expect(forwarded.headers.get('location')).toBe('/?error=unauthorized');
+  } finally {
+    delete process.env.TRUST_PROXY;
+    await server.close();
+  }
 });

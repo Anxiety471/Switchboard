@@ -106,11 +106,17 @@ test('shows an issued token once in the slip and explains outages', () => {
       id: 'id',
       name: 'alpha',
       token: 'shown-once-token',
+      handover: true,
     },
     model: { kind: 'desk', result: { ok: true, value: snapshot } },
   });
   expect(issued).toContain('Copy this token now.');
   expect(issued).toContain('shown-once-token');
+  expect(issued).toContain(
+    'The previous token stops working once this slip has been shown.',
+  );
+  expect(issued).toContain('Acknowledge this token');
+  expect(issued).toContain('name="intent" value="ack-token"');
 
   const down = html({
     theme: 'system',

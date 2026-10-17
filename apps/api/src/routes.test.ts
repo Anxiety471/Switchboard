@@ -126,6 +126,7 @@ test('migration creates agents, messages, and per-recipient receipts', async () 
     { table_name: 'agents', column_name: 'id' },
     { table_name: 'agents', column_name: 'last_seen_at' },
     { table_name: 'agents', column_name: 'name' },
+    { table_name: 'agents', column_name: 'pending_token_hash' },
     { table_name: 'agents', column_name: 'token_hash' },
     { table_name: 'agents', column_name: 'token_revoked' },
     { table_name: 'messages', column_name: 'body' },
@@ -285,6 +286,14 @@ test('missing token is unauthorized on protected routes', async () => {
     {
       method: 'POST' as const,
       url: '/dashboard/agents/00000000-0000-4000-8000-000000000001/token/revoke',
+    },
+    {
+      method: 'POST' as const,
+      url: '/dashboard/agents/00000000-0000-4000-8000-000000000001/token/confirm',
+    },
+    {
+      method: 'POST' as const,
+      url: '/dashboard/agents/00000000-0000-4000-8000-000000000001/token/discard',
     },
     { method: 'POST' as const, url: '/dashboard/sessions' },
     {

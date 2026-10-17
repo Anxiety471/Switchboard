@@ -16,6 +16,7 @@ const DESK_COPY: Record<DeskFailure, string> = {
   failed:
     'The API returned an unexpected response. The ledger was left unchanged.',
   unknown: 'The API returned an unexpected response. The result is unknown.',
+  handover: 'The new token could not be shown. The previous token still works.',
 };
 
 export function failureCopy(

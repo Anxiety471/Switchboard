@@ -1,24 +1,49 @@
-import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  createHmac,
+  hkdfSync,
+  randomBytes,
+  timingSafeEqual,
+} from 'node:crypto';
 import type { DeskFailure } from './ledger';
 
 export const DESK_COOKIE = 'switchboard_desk';
 export const FLASH_COOKIE = 'switchboard_flash';
 export const THEME_COOKIE = 'switchboard_theme';
+export const TOKEN_COOKIE = 'switchboard_token';
+
+const TOKEN_TTL_MS = 120_000;
 
 const FORM_CSRF_TTL_MS = 2 * 60 * 60 * 1000;
 
 export type CookieOptions = {
   httpOnly: boolean;
-  sameSite: 'lax';
+  sameSite: 'lax' | 'strict';
   path: '/';
   secure: boolean;
   maxAge: number;
 };
 
 export type Flash =
-  | { type: 'issued'; id: string; name: string; token: string }
+  | {
+      type: 'issued';
+      id: string;
+      name: string;
+      token: string;
+      handover: boolean;
+    }
   | { type: 'revoked'; name: string }
   | { type: 'failure'; failure: DeskFailure };
+
+export type IssuedSlip = {
+  id: string;
+  name: string;
+  token: string;
+  handover: boolean;
+  exp: number;
+};
 
 export class ReturnPathError extends Error {
   readonly status = 400 as const;
@@ -103,6 +128,16 @@ export function flashCookie(secure: boolean): CookieOptions {
   };
 }
 
+export function tokenCookie(secure: boolean): CookieOptions {
+  return {
+    httpOnly: true,
+    sameSite: 'strict',
+    path: '/',
+    secure,
+    maxAge: 120,
+  };
+}
+
 export function themeCookie(secure: boolean): CookieOptions {
   return {
     httpOnly: true,
@@ -122,7 +157,7 @@ export function serializeCookie(
     `${name}=${value}`,
     `Path=${options.path}`,
     `Max-Age=${options.maxAge}`,
-    'SameSite=Lax',
+    `SameSite=${options.sameSite === 'strict' ? 'Strict' : 'Lax'}`,
   ];
   if (options.httpOnly) {
     parts.push('HttpOnly');
@@ -133,14 +168,97 @@ export function serializeCookie(
   return parts.join('; ');
 }
 
-export function clearCookie(name: string, secure: boolean): string {
+export function clearCookie(
+  name: string,
+  secure: boolean,
+  sameSite: CookieOptions['sameSite'] = 'lax',
+): string {
   return serializeCookie(name, '', {
     httpOnly: true,
-    sameSite: 'lax',
+    sameSite,
     path: '/',
     secure,
     maxAge: 0,
   });
+}
+
+function tokenKey(secret: string): Buffer {
+  return Buffer.from(
+    hkdfSync('sha256', secret, 'switchboard-token-v1', 'aes-256-gcm', 32),
+  );
+}
+
+export function sealIssuedToken(secret: string, slip: IssuedSlip): string {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', tokenKey(secret), iv);
+  const ciphertext = Buffer.concat([
+    cipher.update(JSON.stringify(slip), 'utf8'),
+    cipher.final(),
+  ]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, ciphertext]).toString('base64url');
+}
+
+export function openIssuedToken(
+  secret: string,
+  value: string,
+  now = Date.now(),
+): IssuedSlip | undefined {
+  if (secret === '') {
+    return undefined;
+  }
+  let packed: Buffer;
+  try {
+    packed = Buffer.from(value, 'base64url');
+  } catch {
+    return undefined;
+  }
+  if (packed.length < 12 + 16 + 2) {
+    return undefined;
+  }
+  const iv = packed.subarray(0, 12);
+  const tag = packed.subarray(12, 28);
+  const ciphertext = packed.subarray(28);
+  let plaintext: string;
+  try {
+    const decipher = createDecipheriv('aes-256-gcm', tokenKey(secret), iv);
+    decipher.setAuthTag(tag);
+    plaintext = Buffer.concat([
+      decipher.update(ciphertext),
+      decipher.final(),
+    ]).toString('utf8');
+  } catch {
+    return undefined;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(plaintext) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== 'object' || parsed === null) {
+    return undefined;
+  }
+  const record = parsed as Record<string, unknown>;
+  if (
+    typeof record.id !== 'string' ||
+    typeof record.name !== 'string' ||
+    typeof record.token !== 'string' ||
+    typeof record.handover !== 'boolean' ||
+    typeof record.exp !== 'number' ||
+    !Number.isFinite(record.exp) ||
+    record.exp <= now ||
+    record.exp > now + TOKEN_TTL_MS + 5_000
+  ) {
+    return undefined;
+  }
+  return {
+    id: record.id,
+    name: record.name,
+    token: record.token,
+    handover: record.handover,
+    exp: record.exp,
+  };
 }
 
 function hasControlCharacter(value: string): boolean {

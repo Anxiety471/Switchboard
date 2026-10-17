@@ -1,5 +1,5 @@
 import { buildApp, parseHost, parsePort } from './app.js';
-import { runtimeSecrets } from './options.js';
+import { enforceRuntimeSecrets } from './options.js';
 
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) {
@@ -9,7 +9,7 @@ if (!databaseUrl) {
 const port = parsePort(process.env.PORT);
 const app = buildApp(databaseUrl, {
   logger: true,
-  ...runtimeSecrets(process.env),
+  ...enforceRuntimeSecrets(process.env),
 });
 
 await app.listen({ host: parseHost(process.env.HOST), port });

@@ -68,6 +68,14 @@ test('dashboard routes reject a missing or wrong secret and do not echo it', asy
       method: 'POST' as const,
       url: '/dashboard/agents/00000000-0000-4000-8000-000000000001/token/revoke',
     },
+    {
+      method: 'POST' as const,
+      url: '/dashboard/agents/00000000-0000-4000-8000-000000000001/token/confirm',
+    },
+    {
+      method: 'POST' as const,
+      url: '/dashboard/agents/00000000-0000-4000-8000-000000000001/token/discard',
+    },
     { method: 'POST' as const, url: '/dashboard/sessions' },
     {
       method: 'GET' as const,
@@ -287,14 +295,56 @@ test('POST /dashboard/agents stores only a hash and rejects duplicates', async (
   expect(invalid.json()).toEqual({ error: 'invalid request' });
 });
 
-test('issuing a token replaces it and revoke signs the agent out', async () => {
-  const created = await register('alpha');
-  const first = await app.inject({
+async function assertRawTokenAbsent(token: string): Promise<void> {
+  const columns = await admin.query<{
+    table_name: string;
+    column_name: string;
+    data_type: string;
+  }>(
+    `SELECT table_name, column_name, data_type
+     FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND data_type IN ('text', 'character varying', 'json', 'jsonb', 'bytea')`,
+  );
+  for (const column of columns.rows) {
+    if (
+      !/^[a-z_]+$/.test(column.table_name) ||
+      !/^[a-z_]+$/.test(column.column_name)
+    ) {
+      throw new Error(
+        `unexpected identifier ${column.table_name}.${column.column_name}`,
+      );
+    }
+    const expression =
+      column.data_type === 'bytea'
+        ? `encode(${column.column_name}, 'escape')`
+        : `${column.column_name}::text`;
+    const found = await admin.query(
+      `SELECT 1
+       FROM ${column.table_name}
+       WHERE position($1 in ${expression}) > 0
+       LIMIT 1`,
+      [token],
+    );
+    expect(found.rowCount, `${column.table_name}.${column.column_name}`).toBe(
+      0,
+    );
+  }
+}
+
+async function bearerStatus(token: string): Promise<number> {
+  const response = await app.inject({
     method: 'GET',
     url: '/agents',
-    headers: { authorization: `Bearer ${created.token}` },
+    headers: { authorization: `Bearer ${token}` },
   });
-  expect(first.statusCode).toBe(200);
+  return response.statusCode;
+}
+
+test('a new token works beside the old one until handover is confirmed', async () => {
+  const created = await register('alpha');
+  await assertRawTokenAbsent(created.token);
+  expect(await bearerStatus(created.token)).toBe(200);
 
   const issued = await app.inject({
     method: 'POST',
@@ -306,19 +356,74 @@ test('issuing a token replaces it and revoke signs the agent out', async () => {
   expect(next.id).toBe(created.id);
   expect(next.token).not.toBe(created.token);
   expect(issued.body).not.toContain(SECRET);
+  await assertRawTokenAbsent(created.token);
+  await assertRawTokenAbsent(next.token);
 
-  const retired = await app.inject({
-    method: 'GET',
-    url: '/agents',
-    headers: { authorization: `Bearer ${created.token}` },
+  expect(await bearerStatus(created.token)).toBe(200);
+  expect(await bearerStatus(next.token)).toBe(200);
+  const unconfirmed = await admin.query<{
+    token_revoked: boolean;
+    pending: Buffer | null;
+  }>(
+    `SELECT token_revoked, pending_token_hash AS pending
+     FROM agents
+     WHERE id = $1`,
+    [created.id],
+  );
+  expect(unconfirmed.rows[0]?.token_revoked).toBe(false);
+  expect(unconfirmed.rows[0]?.pending).not.toBeNull();
+
+  const early = await app.inject({
+    method: 'POST',
+    url: `/dashboard/agents/${created.id}/token/discard`,
+    headers: desk(),
   });
-  expect(retired.statusCode).toBe(401);
-  const active = await app.inject({
-    method: 'GET',
-    url: '/agents',
-    headers: { authorization: `Bearer ${next.token}` },
+  expect(early.statusCode).toBe(204);
+  expect(early.body).toBe('');
+  expect(await bearerStatus(created.token)).toBe(200);
+  expect(await bearerStatus(next.token)).toBe(401);
+
+  const again = await app.inject({
+    method: 'POST',
+    url: `/dashboard/agents/${created.id}/token`,
+    headers: desk(),
   });
-  expect(active.statusCode).toBe(200);
+  expect(again.statusCode).toBe(201);
+  const pending = again.json() as RegisteredAgent;
+  expect(await bearerStatus(created.token)).toBe(200);
+  expect(await bearerStatus(pending.token)).toBe(200);
+  await assertRawTokenAbsent(pending.token);
+
+  const confirmed = await app.inject({
+    method: 'POST',
+    url: `/dashboard/agents/${created.id}/token/confirm`,
+    headers: desk(),
+  });
+  expect(confirmed.statusCode).toBe(200);
+  expect(confirmed.json()).toEqual({ id: created.id, name: 'alpha' });
+  expect(confirmed.body).not.toContain(pending.token);
+  expect(confirmed.body).not.toContain(created.token);
+  expect(await bearerStatus(created.token)).toBe(401);
+  expect(await bearerStatus(pending.token)).toBe(200);
+  const promoted = await admin.query<{
+    token_revoked: boolean;
+    pending: Buffer | null;
+  }>(
+    `SELECT token_revoked, pending_token_hash AS pending
+     FROM agents
+     WHERE id = $1`,
+    [created.id],
+  );
+  expect(promoted.rows[0]?.token_revoked).toBe(false);
+  expect(promoted.rows[0]?.pending).toBeNull();
+
+  const repeat = await app.inject({
+    method: 'POST',
+    url: `/dashboard/agents/${created.id}/token/confirm`,
+    headers: desk(),
+  });
+  expect(repeat.statusCode).toBe(404);
+  expect(await bearerStatus(pending.token)).toBe(200);
 
   const revoked = await app.inject({
     method: 'POST',
@@ -332,13 +437,9 @@ test('issuing a token replaces it and revoke signs the agent out', async () => {
     tokenRevoked: true,
   });
   expect(revoked.body).not.toContain(next.token);
+  expect(revoked.body).not.toContain(pending.token);
   expect(revoked.body).not.toContain(created.token);
-  const locked = await app.inject({
-    method: 'GET',
-    url: '/agents',
-    headers: { authorization: `Bearer ${next.token}` },
-  });
-  expect(locked.statusCode).toBe(401);
+  expect(await bearerStatus(pending.token)).toBe(401);
   const seen = await admin.query<{ last_seen_at: Date }>(
     'SELECT last_seen_at FROM agents WHERE id = $1',
     [created.id],
@@ -379,20 +480,29 @@ test('issuing a token replaces it and revoke signs the agent out', async () => {
     url: `/dashboard/agents/${created.id}/token`,
     headers: desk(),
   });
-  const again = restored.json() as RegisteredAgent;
+  const replacement = restored.json() as RegisteredAgent;
   expect(restored.statusCode).toBe(201);
-  const back = await app.inject({
-    method: 'GET',
-    url: '/agents',
-    headers: { authorization: `Bearer ${again.token}` },
+  expect(await bearerStatus(replacement.token)).toBe(200);
+  await assertRawTokenAbsent(replacement.token);
+  const stillRevoked = await admin.query<{ token_revoked: boolean }>(
+    'SELECT token_revoked FROM agents WHERE id = $1',
+    [created.id],
+  );
+  expect(stillRevoked.rows[0]?.token_revoked).toBe(true);
+
+  const handed = await app.inject({
+    method: 'POST',
+    url: `/dashboard/agents/${created.id}/token/confirm`,
+    headers: desk(),
   });
-  expect(back.statusCode).toBe(200);
+  expect(handed.statusCode).toBe(200);
+  expect(await bearerStatus(replacement.token)).toBe(200);
   const flags = await admin.query<{ token_revoked: boolean }>(
     'SELECT token_revoked FROM agents WHERE id = $1',
     [created.id],
   );
   expect(flags.rows[0]?.token_revoked).toBe(false);
-  expect(again).toMatchObject({ id: created.id, name: 'alpha' });
+  expect(replacement).toMatchObject({ id: created.id, name: 'alpha' });
 });
 
 test('message history is oldest-first, paged, and marks broadcasts', async () => {
@@ -607,7 +717,7 @@ test('encoded, mixed-case, and double-slash dashboard paths do not accept an age
   }
 });
 
-test('a new desk session replaces the previous one and a notice is taken once', async () => {
+test('login deletes only expired desk sessions and a notice is taken once', async () => {
   const first = await app.inject({
     method: 'POST',
     url: '/dashboard/sessions',
@@ -641,14 +751,40 @@ test('a new desk session replaces the previous one and a notice is taken once', 
   });
   expect(second.statusCode).toBe(201);
   const next = second.json() as { id: string; csrfToken: string };
-  const stale = await app.inject({
+  const kept = await app.inject({
     method: 'GET',
     url: `/dashboard/sessions/${opened.id}`,
     headers: desk(),
   });
-  expect(stale.statusCode).toBe(404);
+  expect(kept.statusCode).toBe(200);
+  expect(kept.json()).toEqual({ csrfToken: opened.csrfToken });
 
-  const notice = await app.inject({
+  await admin.query(
+    `UPDATE dashboard_sessions
+     SET expires_at = clock_timestamp() - interval '1 second'
+     WHERE id = $1`,
+    [opened.id],
+  );
+  const third = await app.inject({
+    method: 'POST',
+    url: '/dashboard/sessions',
+    headers: desk(),
+  });
+  expect(third.statusCode).toBe(201);
+  const expired = await app.inject({
+    method: 'GET',
+    url: `/dashboard/sessions/${opened.id}`,
+    headers: desk(),
+  });
+  expect(expired.statusCode).toBe(404);
+  const surviving = await app.inject({
+    method: 'GET',
+    url: `/dashboard/sessions/${next.id}`,
+    headers: desk(),
+  });
+  expect(surviving.statusCode).toBe(200);
+
+  const rejected = await app.inject({
     method: 'POST',
     url: `/dashboard/sessions/${next.id}/notices`,
     headers: desk(),
@@ -659,6 +795,15 @@ test('a new desk session replaces the previous one and a notice is taken once', 
       token: 'shown-once',
     },
   });
+  expect(rejected.statusCode).toBe(400);
+  await assertRawTokenAbsent('shown-once');
+
+  const notice = await app.inject({
+    method: 'POST',
+    url: `/dashboard/sessions/${next.id}/notices`,
+    headers: desk(),
+    payload: { type: 'revoked', name: 'alpha' },
+  });
   expect(notice.statusCode).toBe(201);
   const noticeId = (notice.json() as { id: string }).id;
 
@@ -668,12 +813,7 @@ test('a new desk session replaces the previous one and a notice is taken once', 
     headers: desk(),
   });
   expect(taken.statusCode).toBe(200);
-  expect(taken.json()).toEqual({
-    type: 'issued',
-    id: 'agent',
-    name: 'alpha',
-    token: 'shown-once',
-  });
+  expect(taken.json()).toEqual({ type: 'revoked', name: 'alpha' });
   const again = await app.inject({
     method: 'POST',
     url: `/dashboard/sessions/${next.id}/notices/${noticeId}/take`,

@@ -4,14 +4,18 @@ import {
   DESK_COOKIE,
   FLASH_COOKIE,
   THEME_COOKIE,
+  TOKEN_COOKIE,
   clearCookie,
   flashCookie,
   formCsrfValid,
+  openIssuedToken,
   safeReturnPath,
+  sealIssuedToken,
   secretsEqual,
   serializeCookie,
   sessionCookie,
   themeCookie,
+  tokenCookie,
   type Flash,
   ReturnPathError,
 } from './desk';
@@ -22,6 +26,8 @@ import {
 } from './login-limit';
 import {
   closeDeskSession,
+  confirmTokenHandover,
+  discardPendingToken,
   issueAgentToken,
   openDeskSession,
   readDeskSession,
@@ -67,6 +73,8 @@ export type DeskDirectory = {
     id: string,
     flash: Flash,
   ): Promise<DeskResult<{ id: string }>>;
+  confirmHandover(config: DeskConfig, id: string): Promise<DeskResult<true>>;
+  discardPending(config: DeskConfig, id: string): Promise<DeskResult<true>>;
 };
 
 const defaultWrites: LedgerWrites = {
@@ -80,6 +88,8 @@ const defaultDirectory: DeskDirectory = {
   closeSession: closeDeskSession,
   readSession: readDeskSession,
   saveNotice: saveDeskNotice,
+  confirmHandover: confirmTokenHandover,
+  discardPending: discardPendingToken,
 };
 
 export type DeskFormInput = {
@@ -88,6 +98,7 @@ export type DeskFormInput = {
   origin: string | null;
   host: string | null;
   sessionId: string | undefined;
+  tokenCookie: string | undefined;
   clientKey: string;
   now?: number;
   writes?: LedgerWrites;
@@ -141,7 +152,11 @@ function themeCookieHeader(form: FormData, secure: boolean): string[] {
 }
 
 function clearedSession(secure: boolean): string[] {
-  return [clearCookie(DESK_COOKIE, secure), clearCookie(FLASH_COOKIE, secure)];
+  return [
+    clearCookie(DESK_COOKIE, secure),
+    clearCookie(FLASH_COOKIE, secure),
+    clearCookie(TOKEN_COOKIE, secure, 'strict'),
+  ];
 }
 
 export async function handleDeskForm(
@@ -206,14 +221,13 @@ export async function handleDeskForm(
     if (!formCsrfValid(config.secret, csrfField(form), now)) {
       return status(403);
     }
-    if (loginLimited(input.clientKey, now)) {
-      return status(429);
-    }
     const password = form.get('password');
-    if (
-      typeof password !== 'string' ||
-      !secretsEqual(config.secret, password)
-    ) {
+    const accepted =
+      typeof password === 'string' && secretsEqual(config.secret, password);
+    if (!accepted) {
+      if (loginLimited(input.clientKey, now)) {
+        return status(429);
+      }
       noteLoginFailure(input.clientKey, now);
       return redirect('/?error=unauthorized');
     }
@@ -225,6 +239,7 @@ export async function handleDeskForm(
     return redirect('/', [
       serializeCookie(DESK_COOKIE, opened.value.id, sessionCookie(secure)),
       clearCookie(FLASH_COOKIE, secure),
+      clearCookie(TOKEN_COOKIE, secure, 'strict'),
     ]);
   }
 
@@ -240,6 +255,10 @@ export async function handleDeskForm(
   const auth = await authorizeSession(directory, config, form, input);
   if (isAction(auth)) {
     return auth;
+  }
+
+  if (intent === 'ack-token') {
+    return acknowledgeToken(directory, config, input, secure, returnTo);
   }
 
   if (intent === 'register') {
@@ -260,12 +279,7 @@ export async function handleDeskForm(
         failure: result.failure,
       });
     }
-    return remember(directory, config, auth.id, secure, returnTo, {
-      type: 'issued',
-      id: result.value.id,
-      name: result.value.name,
-      token: result.value.token,
-    });
+    return handToken(directory, config, secure, returnTo, result.value, false);
   }
 
   if (intent === 'issue' || intent === 'revoke') {
@@ -280,19 +294,15 @@ export async function handleDeskForm(
       const result = await writes.issueAgentToken(config, id);
       if (!result.ok) {
         if (result.failure === 'unknown') {
-          return redirect('/?error=unknown');
+          await directory.discardPending(config, id);
+          return redirect('/?error=handover');
         }
         return remember(directory, config, auth.id, secure, returnTo, {
           type: 'failure',
           failure: result.failure,
         });
       }
-      return remember(directory, config, auth.id, secure, returnTo, {
-        type: 'issued',
-        id: result.value.id,
-        name: result.value.name,
-        token: result.value.token,
-      });
+      return handToken(directory, config, secure, returnTo, result.value, true);
     }
     const result = await writes.revokeAgentToken(config, id);
     if (!result.ok) {
@@ -340,6 +350,63 @@ async function authorizeSession(
     return status(403);
   }
   return { id: sessionId };
+}
+
+async function handToken(
+  directory: DeskDirectory,
+  config: DeskConfig,
+  secure: boolean,
+  returnTo: string,
+  slip: { id: string; name: string; token: string },
+  handover: boolean,
+): Promise<DeskAction> {
+  let sealed: string;
+  try {
+    sealed = sealIssuedToken(config.secret, {
+      id: slip.id,
+      name: slip.name,
+      token: slip.token,
+      handover,
+      exp: Date.now() + 120_000,
+    });
+  } catch {
+    sealed = '';
+  }
+  if (sealed === '') {
+    if (handover) {
+      await directory.discardPending(config, slip.id);
+    }
+    return redirect('/?error=handover');
+  }
+  return redirect(returnTo, [
+    serializeCookie(TOKEN_COOKIE, sealed, tokenCookie(secure)),
+  ]);
+}
+
+async function acknowledgeToken(
+  directory: DeskDirectory,
+  config: DeskConfig,
+  input: DeskFormInput,
+  secure: boolean,
+  returnTo: string,
+): Promise<DeskAction> {
+  const raw = input.tokenCookie;
+  if (raw === undefined || raw === '') {
+    return redirect(returnTo);
+  }
+  const slip = openIssuedToken(config.secret, raw);
+  if (slip === undefined) {
+    return redirect('/?error=handover', [
+      clearCookie(TOKEN_COOKIE, secure, 'strict'),
+    ]);
+  }
+  if (slip.handover) {
+    const confirmed = await directory.confirmHandover(config, slip.id);
+    if (!confirmed.ok && confirmed.failure !== 'not_found') {
+      return redirect('/?error=handover');
+    }
+  }
+  return redirect(returnTo, [clearCookie(TOKEN_COOKIE, secure, 'strict')]);
 }
 
 async function remember(

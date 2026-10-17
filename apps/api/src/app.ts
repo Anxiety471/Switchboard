@@ -475,8 +475,10 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
           `WITH touched AS (
            UPDATE agents
            SET last_seen_at = clock_timestamp()
-           WHERE token_hash = $1
-             AND token_revoked = false
+           WHERE (
+               (token_revoked = false AND token_hash = $1)
+               OR pending_token_hash = $1
+             )
              AND (
                last_seen_at IS NULL
                OR last_seen_at < clock_timestamp() - interval '10 seconds'
@@ -484,8 +486,8 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
          )
          SELECT id, name
          FROM agents
-         WHERE token_hash = $1
-           AND token_revoked = false`,
+         WHERE (token_revoked = false AND token_hash = $1)
+            OR pending_token_hash = $1`,
           [hashToken(token)],
         );
       } catch (error) {

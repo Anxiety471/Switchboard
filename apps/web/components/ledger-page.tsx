@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react';
+import { AcknowledgeToken } from './acknowledge-token';
 import type { DashboardAgent, InboxPage } from '@switchboard/shared';
 import { failureCopy } from '../lib/copy';
 import type { Flash } from '../lib/desk';
@@ -90,7 +91,11 @@ function Shell(props: {
   );
 }
 
-function Notices(props: { flash: Flash | undefined; where: 'login' | 'desk' }) {
+function Notices(props: {
+  flash: Flash | undefined;
+  where: 'login' | 'desk';
+  csrf: string;
+}) {
   if (props.flash === undefined) {
     return null;
   }
@@ -102,9 +107,18 @@ function Notices(props: { flash: Flash | undefined; where: 'login' | 'desk' }) {
           Copy this token now. Switchboard stores only its SHA-256 hash, and
           this slip is shown once.
         </p>
+        {props.flash.handover ? (
+          <p>The previous token stops working once this slip has been shown.</p>
+        ) : null}
         <pre>
           <code>{props.flash.token}</code>
         </pre>
+        <AcknowledgeToken />
+        <form method="post" action="/desk">
+          <input type="hidden" name="intent" value="ack-token" />
+          <input type="hidden" name="csrf" value={props.csrf} />
+          <button type="submit">Acknowledge this token</button>
+        </form>
       </section>
     );
   }
@@ -152,7 +166,8 @@ function Desk(props: {
         </form>
         <p className="hint">
           Start with a letter or number, then use letters, numbers, underscores,
-          or hyphens. Issuing a token later replaces the previous one.
+          or hyphens. A later token keeps the previous one working until the new
+          slip has been shown.
         </p>
       </section>
 
@@ -417,7 +432,7 @@ export function LedgerPage(props: LedgerPageProps) {
       signedIn={props.model.kind === 'desk'}
       csrf={props.csrf}
     >
-      <Notices flash={props.flash} where={where} />
+      <Notices flash={props.flash} where={where} csrf={props.csrf} />
       {props.model.kind === 'unconfigured' ? (
         <Banner failure="unconfigured" where="desk" />
       ) : null}

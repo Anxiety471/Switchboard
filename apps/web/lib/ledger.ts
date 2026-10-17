@@ -19,7 +19,8 @@ export type DeskFailure =
   | 'conflict'
   | 'not_found'
   | 'failed'
-  | 'unknown';
+  | 'unknown'
+  | 'handover';
 
 export type DeskResult<T> =
   { ok: true; value: T } | { ok: false; failure: DeskFailure };
@@ -451,7 +452,8 @@ function isFailure(value: unknown): value is DeskFailure {
     value === 'conflict' ||
     value === 'not_found' ||
     value === 'failed' ||
-    value === 'unknown'
+    value === 'unknown' ||
+    value === 'handover'
   );
 }
 
@@ -503,18 +505,8 @@ function parseFlash(value: unknown): Flash | undefined {
   if (!isRecord(value)) {
     return undefined;
   }
-  if (
-    value.type === 'issued' &&
-    typeof value.id === 'string' &&
-    typeof value.name === 'string' &&
-    typeof value.token === 'string'
-  ) {
-    return {
-      type: 'issued',
-      id: value.id,
-      name: value.name,
-      token: value.token,
-    };
+  if (value.type === 'issued' || 'token' in value) {
+    return { type: 'failure', failure: 'handover' };
   }
   if (value.type === 'revoked' && typeof value.name === 'string') {
     return { type: 'revoked', name: value.name };
@@ -621,4 +613,56 @@ export async function takeDeskNotice(
     return { ok: false, failure: 'unknown' };
   }
   return { ok: true, value: flash };
+}
+
+const AGENT_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export async function confirmTokenHandover(
+  config: DeskConfig,
+  id: string,
+): Promise<DeskResult<true>> {
+  if (!AGENT_ID.test(id)) {
+    return { ok: false, failure: 'invalid' };
+  }
+  const result = await request(
+    config,
+    `/dashboard/agents/${id}/token/confirm`,
+    {
+      method: 'POST',
+    },
+  );
+  if (!result.ok) {
+    return result;
+  }
+  if (
+    !isRecord(result.value) ||
+    typeof result.value.id !== 'string' ||
+    typeof result.value.name !== 'string' ||
+    'token' in result.value
+  ) {
+    return { ok: false, failure: 'unknown' };
+  }
+  return { ok: true, value: true };
+}
+
+export async function discardPendingToken(
+  config: DeskConfig,
+  id: string,
+): Promise<DeskResult<true>> {
+  if (!AGENT_ID.test(id)) {
+    return { ok: false, failure: 'invalid' };
+  }
+  const result = await request(
+    config,
+    `/dashboard/agents/${id}/token/discard`,
+    {
+      method: 'POST',
+      allowEmpty: true,
+    },
+  );
+  if (!result.ok) {
+    return result;
+  }
+  return { ok: true, value: true };
 }

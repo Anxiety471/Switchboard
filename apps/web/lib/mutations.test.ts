@@ -1,5 +1,5 @@
 import { beforeEach, expect, test } from 'vitest';
-import { issueFormCsrf, type Flash } from './desk';
+import { issueFormCsrf, openIssuedToken, type Flash } from './desk';
 import { resetLoginLimits } from './login-limit';
 import type { DeskResult } from './ledger';
 import {
@@ -30,6 +30,9 @@ type MemoryDirectory = DeskDirectory & {
   session: { id: string; csrfToken: string } | undefined;
   notices: Map<string, Flash>;
   saves: number;
+  confirms: string[];
+  discards: string[];
+  confirmOk: boolean;
 };
 
 function memoryDirectory(): MemoryDirectory {
@@ -37,6 +40,9 @@ function memoryDirectory(): MemoryDirectory {
     session: undefined,
     notices: new Map(),
     saves: 0,
+    confirms: [],
+    discards: [],
+    confirmOk: true,
     openSession() {
       this.session = {
         id: 'session-id-session-id-session-id-sess',
@@ -68,6 +74,17 @@ function memoryDirectory(): MemoryDirectory {
       const noticeId = `notice-id-notice-id-notice-id-notice-${this.notices.size}`;
       this.notices.set(noticeId, flash);
       return Promise.resolve({ ok: true, value: { id: noticeId } });
+    },
+    confirmHandover(_config, id) {
+      this.confirms.push(id);
+      if (!this.confirmOk) {
+        return Promise.resolve({ ok: false, failure: 'unreachable' });
+      }
+      return Promise.resolve({ ok: true, value: true });
+    },
+    discardPending(_config, id) {
+      this.discards.push(id);
+      return Promise.resolve({ ok: true, value: true });
     },
   };
   return directory;
@@ -110,6 +127,7 @@ function input(
     origin: 'http://127.0.0.1:3000',
     host: '127.0.0.1:3000',
     sessionId: undefined,
+    tokenCookie: undefined,
     clientKey: 'client-a',
     directory,
     ...extra,
@@ -269,6 +287,27 @@ test('repeated login failures are limited and do not grow a notice store', async
   ).toEqual({ kind: 'status', status: 429 });
   expect(directory.saves).toBe(0);
   expect(directory.session).toBeUndefined();
+
+  const accepted = await handleDeskForm(
+    fields({ intent: 'login', password: SECRET, csrf }),
+    input(directory, { clientKey: 'limited' }),
+  );
+  expect(accepted).toMatchObject({ kind: 'redirect', location: '/' });
+  expect(directory.session).toBeDefined();
+
+  const other = memoryDirectory();
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    await handleDeskForm(form, input(other, { clientKey: 'locked-out' }));
+  }
+  expect(
+    await handleDeskForm(form, input(other, { clientKey: 'locked-out' })),
+  ).toEqual({ kind: 'status', status: 429 });
+  const beside = await handleDeskForm(
+    fields({ intent: 'login', password: SECRET, csrf }),
+    input(other, { clientKey: 'someone-else' }),
+  );
+  expect(beside).toMatchObject({ kind: 'redirect', location: '/' });
+  expect(other.session).toBeDefined();
 });
 
 test('register, issue, and revoke require the session csrf token', async () => {
@@ -315,15 +354,20 @@ test('register, issue, and revoke require the session csrf token', async () => {
   );
   expect(issued).toMatchObject({ kind: 'redirect', location: '/?inbox=keep' });
   expect(client.calls).toEqual(['register']);
+  expect(directory.saves).toBe(0);
   if (issued.kind === 'redirect') {
-    const noticeId = cookieValue(issued.cookies, 'switchboard_flash');
-    expect(directory.notices.get(noticeId ?? '')).toEqual({
-      type: 'issued',
+    const sealed = cookieValue(issued.cookies, 'switchboard_token');
+    expect(sealed).toBeDefined();
+    expect(issued.cookies.join('\n')).toContain('HttpOnly');
+    expect(issued.cookies.join('\n')).toContain('SameSite=Strict');
+    expect(issued.cookies.join('\n')).toContain('Max-Age=120');
+    expect(issued.cookies.join('\n')).not.toContain('issued-token');
+    expect(openIssuedToken(SECRET, sealed ?? '')).toMatchObject({
       id: 'agent-id',
       name: 'alpha',
       token: 'issued-token',
+      handover: false,
     });
-    expect(issued.cookies.join('\n')).not.toContain('issued-token');
   }
 
   const conflict: LedgerWrites = {
@@ -350,7 +394,7 @@ test('register, issue, and revoke require the session csrf token', async () => {
     });
   }
 
-  await handleDeskForm(
+  const rotated = await handleDeskForm(
     fields({
       intent: 'issue',
       id: '00000000-0000-4000-8000-000000000001',
@@ -359,6 +403,18 @@ test('register, issue, and revoke require the session csrf token', async () => {
     input(directory, { writes: client, sessionId }),
   );
   expect(client.calls).toContain('issue');
+  expect(directory.saves).toBe(1);
+  expect(rotated.kind).toBe('redirect');
+  if (rotated.kind !== 'redirect') {
+    return;
+  }
+  const rotatedSeal = cookieValue(rotated.cookies, 'switchboard_token');
+  expect(rotated.cookies.join('\n')).not.toContain('rotated-token');
+  expect(rotated.cookies.join('\n')).toContain('SameSite=Strict');
+  expect(openIssuedToken(SECRET, rotatedSeal ?? '')).toMatchObject({
+    token: 'rotated-token',
+    handover: true,
+  });
 
   const unknown = await handleDeskForm(
     fields({
@@ -377,31 +433,55 @@ test('register, issue, and revoke require the session csrf token', async () => {
   );
   expect(unknown).toEqual({
     kind: 'redirect',
-    location: '/?error=unknown',
+    location: '/?error=handover',
     cookies: [],
   });
+  expect(directory.discards).toEqual(['00000000-0000-4000-8000-000000000001']);
   expect(JSON.stringify(unknown)).not.toContain('rotated-token');
 
-  directory.saveNotice = () => {
-    directory.saves += 1;
-    return Promise.resolve({ ok: false, failure: 'unreachable' });
-  };
-  const lost = await handleDeskForm(
-    fields({
-      intent: 'issue',
-      id: '00000000-0000-4000-8000-000000000001',
-      csrf: sessionCsrf,
-    }),
-    input(directory, { writes: client, sessionId }),
+  directory.confirmOk = false;
+  const held = await handleDeskForm(
+    fields({ intent: 'ack-token', csrf: sessionCsrf }),
+    input(directory, { writes: client, sessionId, tokenCookie: rotatedSeal }),
   );
-  expect(lost).toEqual({
+  expect(held).toEqual({
     kind: 'redirect',
-    location: '/?error=unknown',
+    location: '/?error=handover',
     cookies: [],
   });
-  expect(JSON.stringify(lost)).not.toContain('rotated-token');
+  expect(directory.confirms).toEqual(['agent-id']);
+  expect(JSON.stringify(held)).not.toContain('rotated-token');
 
-  directory.saveNotice = memoryDirectory().saveNotice.bind(directory);
+  directory.confirmOk = true;
+  directory.confirmHandover = () =>
+    Promise.resolve({ ok: false, failure: 'not_found' });
+  const settled = await handleDeskForm(
+    fields({ intent: 'ack-token', csrf: sessionCsrf }),
+    input(directory, { writes: client, sessionId, tokenCookie: rotatedSeal }),
+  );
+  expect(settled.kind).toBe('redirect');
+  if (settled.kind === 'redirect') {
+    expect(settled.location).toBe('/');
+    expect(cookieValue(settled.cookies, 'switchboard_token')).toBe('');
+    expect(settled.cookies.join('\n')).not.toContain('rotated-token');
+  }
+
+  directory.confirmHandover = (_config, id) => {
+    directory.confirms.push(id);
+    return Promise.resolve({ ok: true, value: true });
+  };
+  const acked = await handleDeskForm(
+    fields({ intent: 'ack-token', csrf: sessionCsrf }),
+    input(directory, { writes: client, sessionId, tokenCookie: rotatedSeal }),
+  );
+  expect(acked.kind).toBe('redirect');
+  if (acked.kind === 'redirect') {
+    expect(cookieValue(acked.cookies, 'switchboard_token')).toBe('');
+    expect(acked.cookies.join('\n')).toContain('SameSite=Strict');
+    expect(acked.cookies.join('\n')).toContain('Max-Age=0');
+    expect(acked.cookies.join('\n')).not.toContain('rotated-token');
+  }
+  expect(directory.confirms).toEqual(['agent-id', 'agent-id']);
   const revoked = await handleDeskForm(
     fields({
       intent: 'revoke',

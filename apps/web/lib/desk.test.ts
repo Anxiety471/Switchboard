@@ -1,11 +1,15 @@
 import { expect, test } from 'vitest';
 import {
   ReturnPathError,
+  TOKEN_COOKIE,
   formCsrfValid,
   issueFormCsrf,
+  openIssuedToken,
   safeReturnPath,
+  sealIssuedToken,
   serializeCookie,
   sessionCookie,
+  tokenCookie,
 } from './desk';
 
 const SECRET = 'desk-secret-desk-secret-desk-secret';
@@ -58,4 +62,31 @@ test('session cookies are HttpOnly and Secure only when asked', () => {
   );
   expect(secure).toContain('Secure');
   expect(secure).not.toContain(SECRET);
+});
+
+test('an issued token is sealed in a short-lived strict cookie', () => {
+  const now = 1_700_000_000_000;
+  const slip = {
+    id: 'agent-id',
+    name: 'alpha',
+    token: 'raw-token-value',
+    handover: true,
+    exp: now + 60_000,
+  };
+  const sealed = sealIssuedToken(SECRET, slip);
+  expect(sealed).not.toContain('raw-token-value');
+  expect(openIssuedToken(SECRET, sealed, now)).toEqual(slip);
+  expect(
+    openIssuedToken('other-secret-other-secret-other-sec', sealed, now),
+  ).toBeUndefined();
+  expect(openIssuedToken(SECRET, sealed, slip.exp)).toBeUndefined();
+  const far = sealIssuedToken(SECRET, { ...slip, exp: now + 130_000 });
+  expect(openIssuedToken(SECRET, far, now)).toBeUndefined();
+
+  const header = serializeCookie(TOKEN_COOKIE, sealed, tokenCookie(true));
+  expect(header).toContain('HttpOnly');
+  expect(header).toContain('SameSite=Strict');
+  expect(header).toContain('Secure');
+  expect(header).toContain('Max-Age=120');
+  expect(header).not.toContain('raw-token-value');
 });

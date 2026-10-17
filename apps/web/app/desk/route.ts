@@ -1,5 +1,9 @@
-import { DESK_COOKIE } from '../../lib/desk';
-import { deskClientKey } from '../../lib/login-limit';
+import { DESK_COOKIE, TOKEN_COOKIE } from '../../lib/desk';
+import {
+  deskClientKey,
+  socketAddress,
+  trustProxyEnabled,
+} from '../../lib/login-limit';
 import { handleDeskForm } from '../../lib/mutations';
 
 export const dynamic = 'force-dynamic';
@@ -17,7 +21,12 @@ export async function POST(request: Request): Promise<Response> {
     origin: request.headers.get('origin'),
     host: requestHost(request),
     sessionId: cookieValue(request, DESK_COOKIE),
-    clientKey: deskClientKey(request),
+    tokenCookie: cookieValue(request, TOKEN_COOKIE),
+    clientKey: deskClientKey({
+      forwardedFor: request.headers.get('x-forwarded-for'),
+      socketAddress: socketAddress(request),
+      trustProxy: trustProxyEnabled(process.env.TRUST_PROXY),
+    }),
   });
   if (action.kind === 'status') {
     return new Response(null, { status: action.status });

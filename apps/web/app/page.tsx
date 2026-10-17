@@ -5,7 +5,9 @@ import {
   DESK_COOKIE,
   FLASH_COOKIE,
   THEME_COOKIE,
+  TOKEN_COOKIE,
   issueFormCsrf,
+  openIssuedToken,
   themeFromCookie,
   type Flash,
 } from '../lib/desk';
@@ -33,7 +35,8 @@ function isFailure(value: string): value is DeskFailure {
     value === 'conflict' ||
     value === 'not_found' ||
     value === 'failed' ||
-    value === 'unknown'
+    value === 'unknown' ||
+    value === 'handover'
   );
 }
 
@@ -63,6 +66,28 @@ export default async function HomePage(props: {
   const theme = themeFromCookie(jar.get(THEME_COOKIE)?.value);
   const config = readDeskConfig(process.env);
   const banner = errorFlash(params);
+  const sealed = jar.get(TOKEN_COOKIE)?.value;
+  const slip =
+    config !== undefined && sealed !== undefined && sealed !== ''
+      ? openIssuedToken(config.secret, sealed)
+      : undefined;
+  const issued: Flash | undefined =
+    slip === undefined
+      ? undefined
+      : {
+          type: 'issued',
+          id: slip.id,
+          name: slip.name,
+          token: slip.token,
+          handover: slip.handover,
+        };
+  const tokenMiss =
+    sealed !== undefined &&
+    sealed !== '' &&
+    config !== undefined &&
+    slip === undefined
+      ? ({ type: 'failure', failure: 'handover' } as const)
+      : undefined;
 
   if (config === undefined) {
     return (
@@ -114,9 +139,9 @@ export default async function HomePage(props: {
     );
   }
 
-  let flash = banner;
+  let flash: Flash | undefined = issued ?? tokenMiss ?? banner;
   const noticeId = jar.get(FLASH_COOKIE)?.value;
-  if (noticeId !== undefined && noticeId !== '') {
+  if (issued === undefined && noticeId !== undefined && noticeId !== '') {
     const taken = await takeDeskNotice(config, sessionId, noticeId);
     if (taken.ok) {
       flash = taken.value;

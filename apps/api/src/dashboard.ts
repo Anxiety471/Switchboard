@@ -91,27 +91,70 @@ function requiredRow<T>(rows: readonly T[]): T {
   return row;
 }
 
-async function storeToken(
+async function storePendingToken(
   pool: Pool,
   agentId: string,
-  revoked: boolean,
 ): Promise<{ id: string; name: string; token: string } | undefined> {
+  const existing = await pool.query<{ id: string }>(
+    'SELECT id FROM agents WHERE id = $1::uuid',
+    [agentId],
+  );
+  if (existing.rows[0] === undefined) {
+    return undefined;
+  }
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const token = generateToken();
+    const hash = hashToken(token);
+    try {
+      const result = await pool.query<{ id: string; name: string }>(
+        `UPDATE agents
+         SET pending_token_hash = $2
+         WHERE id = $1::uuid
+           AND NOT EXISTS (
+             SELECT 1
+             FROM agents AS other
+             WHERE other.token_hash = $2
+                OR other.pending_token_hash = $2
+           )
+         RETURNING id, name`,
+        [agentId, hash],
+      );
+      const row = result.rows[0];
+      if (row === undefined) {
+        continue;
+      }
+      return { id: row.id, name: row.name, token };
+    } catch (error) {
+      if (pgField(error, 'code') === '23505' && attempt < 2) {
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw new Error('token hash collision');
+}
+
+async function revokeStoredToken(
+  pool: Pool,
+  agentId: string,
+): Promise<{ id: string; name: string } | undefined> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const hash = hashToken(generateToken());
     try {
       const result = await pool.query<{ id: string; name: string }>(
         `UPDATE agents
          SET token_hash = $2,
-             token_revoked = $3
+             token_revoked = true,
+             pending_token_hash = NULL
          WHERE id = $1::uuid
          RETURNING id, name`,
-        [agentId, hashToken(token), revoked],
+        [agentId, hash],
       );
       const row = result.rows[0];
       if (row === undefined) {
         return undefined;
       }
-      return { id: row.id, name: row.name, token };
+      return row;
     } catch (error) {
       if (
         pgField(error, 'code') === '23505' &&
@@ -155,23 +198,8 @@ function parseNotice(value: unknown): Record<string, unknown> | undefined {
     return undefined;
   }
   const record = value as Record<string, unknown>;
-  if (record.type === 'issued') {
-    if (
-      typeof record.id !== 'string' ||
-      typeof record.name !== 'string' ||
-      typeof record.token !== 'string' ||
-      record.id.length > 128 ||
-      record.name.length > 64 ||
-      record.token.length > 256
-    ) {
-      return undefined;
-    }
-    return {
-      type: 'issued',
-      id: record.id,
-      name: record.name,
-      token: record.token,
-    };
+  if (record.type === 'issued' || 'token' in record) {
+    return undefined;
   }
   if (record.type === 'revoked') {
     if (typeof record.name !== 'string' || record.name.length > 64) {
@@ -525,7 +553,7 @@ export function registerDashboardRoutes(
         },
       },
       async (request, reply) => {
-        const stored = await storeToken(pool, request.params.id, false);
+        const stored = await storePendingToken(pool, request.params.id);
         if (stored === undefined) {
           return reply.code(404).send({ error: 'not found' });
         }
@@ -563,7 +591,7 @@ export function registerDashboardRoutes(
         },
       },
       async (request, reply) => {
-        const stored = await storeToken(pool, request.params.id, true);
+        const stored = await revokeStoredToken(pool, request.params.id);
         if (stored === undefined) {
           return reply.code(404).send({ error: 'not found' });
         }
@@ -576,13 +604,80 @@ export function registerDashboardRoutes(
       },
     );
 
+    app.post<{ Params: AgentParams }>(
+      '/dashboard/agents/:id/token/confirm',
+      {
+        schema: {
+          params: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['id'],
+            properties: { id: ID_SCHEMA },
+          },
+          response: {
+            200: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['id', 'name'],
+              properties: {
+                id: { type: 'string' },
+                name: { type: 'string' },
+              },
+            },
+          },
+        },
+      },
+      async (request, reply) => {
+        const result = await pool.query<{ id: string; name: string }>(
+          `UPDATE agents
+           SET token_hash = pending_token_hash,
+               pending_token_hash = NULL,
+               token_revoked = false
+           WHERE id = $1::uuid
+             AND pending_token_hash IS NOT NULL
+           RETURNING id, name`,
+          [request.params.id],
+        );
+        const row = result.rows[0];
+        if (row === undefined) {
+          return reply.code(404).send({ error: 'not found' });
+        }
+        return { id: row.id, name: row.name };
+      },
+    );
+
+    app.post<{ Params: AgentParams }>(
+      '/dashboard/agents/:id/token/discard',
+      {
+        schema: {
+          params: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['id'],
+            properties: { id: ID_SCHEMA },
+          },
+        },
+      },
+      async (request, reply) => {
+        await pool.query(
+          `UPDATE agents
+           SET pending_token_hash = NULL
+           WHERE id = $1::uuid`,
+          [request.params.id],
+        );
+        return reply.code(204).send();
+      },
+    );
+
     app.post('/dashboard/sessions', async (_request, reply) => {
       const id = newSecret();
       const csrfToken = newSecret();
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
-        await client.query('DELETE FROM dashboard_sessions');
+        await client.query(
+          'DELETE FROM dashboard_sessions WHERE expires_at <= clock_timestamp()',
+        );
         await client.query(
           `INSERT INTO dashboard_sessions (id, csrf_token, expires_at)
              VALUES ($1, $2, clock_timestamp() + $3::interval)`,
