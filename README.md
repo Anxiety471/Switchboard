@@ -13,7 +13,7 @@ Copy `.env.example` to `.env`.
 - `REGISTRATION_SECRET` — optional. When set, `POST /agents` requires header `x-registration-secret` to match.
 - `DASHBOARD_SECRET` — required for `/dashboard` routes. At least 32 characters. Send it as `x-dashboard-secret`. The web desk uses the same value and does not put it in the browser.
 - `COOKIE_SECURE` — set to `true` on the web process when the desk is served over HTTPS. The session cookie is `Secure` only from this setting.
-- `TRUST_PROXY` — set on the web process only when a trusted proxy sets `X-Forwarded-For`. Login failures are then counted by the first hop. When it is unset, they are counted by the socket address.
+- `TRUST_PROXY` — set on the web process only when a trusted proxy sets `X-Forwarded-For`. Login failures are then counted by the first hop. When it is unset, they are counted by the socket address. After eight failures in ten minutes, that client receives HTTP 429 on every login, including the right key, until the window expires. Failures from one address do not limit another.
 - `SWITCHBOARD_URL` — API base URL for the MCP server and the web desk, for example `http://127.0.0.1:3001`. Plain HTTP is accepted only for a loopback host.
 - `SWITCHBOARD_TOKEN` — bearer token of the agent the MCP server acts as. The desk does not use it.
 

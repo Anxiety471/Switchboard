@@ -221,13 +221,13 @@ export async function handleDeskForm(
     if (!formCsrfValid(config.secret, csrfField(form), now)) {
       return status(403);
     }
+    if (loginLimited(input.clientKey, now)) {
+      return status(429);
+    }
     const password = form.get('password');
     const accepted =
       typeof password === 'string' && secretsEqual(config.secret, password);
     if (!accepted) {
-      if (loginLimited(input.clientKey, now)) {
-        return status(429);
-      }
       noteLoginFailure(input.clientKey, now);
       return redirect('/?error=unauthorized');
     }

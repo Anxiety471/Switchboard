@@ -660,14 +660,28 @@ test('an agent inbox is readable without marking it read or updating last_seen',
   expect(missing.body).not.toContain(alpha.token);
 });
 
-function rawGet(
+function rawRequest(
   port: number,
+  method: string,
   path: string,
   headers: Record<string, string>,
+  body?: string,
 ): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     const req = httpRequest(
-      { hostname: '127.0.0.1', port, path, method: 'GET', headers },
+      {
+        hostname: '127.0.0.1',
+        port,
+        path,
+        method,
+        headers:
+          body === undefined
+            ? headers
+            : {
+                ...headers,
+                'content-length': String(Buffer.byteLength(body)),
+              },
+      },
       (res) => {
         const chunks: Buffer[] = [];
         res.on('data', (chunk: Buffer) => {
@@ -682,8 +696,19 @@ function rawGet(
       },
     );
     req.on('error', reject);
+    if (body !== undefined) {
+      req.write(body);
+    }
     req.end();
   });
+}
+
+function rawGet(
+  port: number,
+  path: string,
+  headers: Record<string, string>,
+): Promise<{ status: number; body: string }> {
+  return rawRequest(port, 'GET', path, headers);
 }
 
 test('encoded, mixed-case, and double-slash dashboard paths do not accept an agent token', async () => {
@@ -708,10 +733,65 @@ test('encoded, mixed-case, and double-slash dashboard paths do not accept an age
       expect(response.body, path).not.toContain(alpha.name);
       expect(response.body, path).not.toContain(alpha.token);
     }
+    const before = await admin.query<{
+      token_hash: Buffer;
+      pending_token_hash: Buffer | null;
+    }>('SELECT token_hash, pending_token_hash FROM agents WHERE id = $1', [
+      alpha.id,
+    ]);
+    const planted = 'should-not-exist';
+    const registerPost = await rawRequest(
+      port,
+      'POST',
+      '/%64ashboard/agents',
+      {
+        authorization: `Bearer ${alpha.token}`,
+        'content-type': 'application/json',
+      },
+      JSON.stringify({ name: planted }),
+    );
+    expect(registerPost.status).toBe(401);
+    expect(registerPost.body).not.toContain(alpha.token);
+    expect(registerPost.body).not.toContain(planted);
+    const rotatePost = await rawRequest(
+      port,
+      'POST',
+      `/%64ashboard/agents/${alpha.id}/token`,
+      {
+        authorization: `Bearer ${alpha.token}`,
+        'content-type': 'application/json',
+      },
+      '',
+    );
+    expect(rotatePost.status).toBe(401);
+    expect(rotatePost.body).not.toContain(alpha.token);
+
+    const names = await admin.query<{ name: string }>(
+      'SELECT name FROM agents ORDER BY name',
+    );
+    expect(names.rows.map((row) => row.name)).toEqual(['alpha']);
+    const after = await admin.query<{
+      token_hash: Buffer;
+      pending_token_hash: Buffer | null;
+    }>('SELECT token_hash, pending_token_hash FROM agents WHERE id = $1', [
+      alpha.id,
+    ]);
+    expect(after.rows[0]?.pending_token_hash).toBeNull();
+    expect(
+      Buffer.from(after.rows[0]?.token_hash ?? Buffer.alloc(0)).equals(
+        Buffer.from(before.rows[0]?.token_hash ?? Buffer.alloc(0)),
+      ),
+    ).toBe(true);
+    const still = await rawGet(port, '/agents', {
+      authorization: `Bearer ${alpha.token}`,
+    });
+    expect(still.status).toBe(200);
+
     const opened = await rawGet(port, '/dashboard/agents', desk());
     expect(opened.status).toBe(200);
     expect(opened.body).toContain(alpha.name);
     expect(opened.body).not.toContain(alpha.token);
+    expect(opened.body).not.toContain(planted);
   } finally {
     await exposed.close();
   }

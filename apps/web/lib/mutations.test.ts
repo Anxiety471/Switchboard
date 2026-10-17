@@ -288,26 +288,53 @@ test('repeated login failures are limited and do not grow a notice store', async
   expect(directory.saves).toBe(0);
   expect(directory.session).toBeUndefined();
 
-  const accepted = await handleDeskForm(
+  const locked = await handleDeskForm(
     fields({ intent: 'login', password: SECRET, csrf }),
     input(directory, { clientKey: 'limited' }),
   );
-  expect(accepted).toMatchObject({ kind: 'redirect', location: '/' });
-  expect(directory.session).toBeDefined();
+  expect(locked).toEqual({ kind: 'status', status: 429 });
+  expect(directory.session).toBeUndefined();
 
   const other = memoryDirectory();
-  for (let attempt = 0; attempt < 8; attempt += 1) {
-    await handleDeskForm(form, input(other, { clientKey: 'locked-out' }));
-  }
-  expect(
-    await handleDeskForm(form, input(other, { clientKey: 'locked-out' })),
-  ).toEqual({ kind: 'status', status: 429 });
   const beside = await handleDeskForm(
     fields({ intent: 'login', password: SECRET, csrf }),
     input(other, { clientKey: 'someone-else' }),
   );
   expect(beside).toMatchObject({ kind: 'redirect', location: '/' });
   expect(other.session).toBeDefined();
+
+  const start = 1_700_000_000_000;
+  const windowed = memoryDirectory();
+  const earlyCsrf = issueFormCsrf(SECRET, start);
+  const wrong = fields({ intent: 'login', password: 'nope', csrf: earlyCsrf });
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    await handleDeskForm(
+      wrong,
+      input(windowed, { clientKey: 'window', now: start }),
+    );
+  }
+  const during = start + 1_000;
+  expect(
+    await handleDeskForm(
+      fields({
+        intent: 'login',
+        password: SECRET,
+        csrf: issueFormCsrf(SECRET, during),
+      }),
+      input(windowed, { clientKey: 'window', now: during }),
+    ),
+  ).toEqual({ kind: 'status', status: 429 });
+  const released = start + 10 * 60 * 1000;
+  const opened = await handleDeskForm(
+    fields({
+      intent: 'login',
+      password: SECRET,
+      csrf: issueFormCsrf(SECRET, released),
+    }),
+    input(windowed, { clientKey: 'window', now: released }),
+  );
+  expect(opened).toMatchObject({ kind: 'redirect', location: '/' });
+  expect(windowed.session).toBeDefined();
 });
 
 test('register, issue, and revoke require the session csrf token', async () => {
