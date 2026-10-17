@@ -11,11 +11,9 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.typecheck.json --noEmit",
-    "test": "vitest run"
+    "typecheck": "tsc -p tsconfig.typecheck.json --noEmit"
   },
   "devDependencies": {
-    "typescript": "catalog:",
-    "vitest": "catalog:"
+    "typescript": "catalog:"
   }
 }

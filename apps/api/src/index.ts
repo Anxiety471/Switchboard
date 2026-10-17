@@ -1,4 +1,4 @@
-import { buildApp } from './app.js';
+import { buildApp, parsePort } from './app.js';
 
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) {
@@ -6,7 +6,7 @@ if (!databaseUrl) {
 }
 
 const port = parsePort(process.env.PORT);
-const app = buildApp(databaseUrl);
+const app = buildApp(databaseUrl, { logger: true });
 
 await app.listen({ host: '0.0.0.0', port });
 
@@ -18,12 +18,18 @@ function shutdown(signal: NodeJS.Signals): void {
   }
   shuttingDown = true;
   app.log.info({ signal }, 'shutting down');
+  const forceExit = setTimeout(() => {
+    process.exit(1);
+  }, 5000);
+  forceExit.unref();
   app
     .close()
     .then(() => {
+      clearTimeout(forceExit);
       process.exit(0);
     })
     .catch((error: unknown) => {
+      clearTimeout(forceExit);
       app.log.error(error, 'shutdown failed');
       process.exit(1);
     });
@@ -35,13 +41,3 @@ process.once('SIGINT', () => {
 process.once('SIGTERM', () => {
   shutdown('SIGTERM');
 });
-
-function parsePort(value: string | undefined): number {
-  const raw = value ?? '3001';
-  if (!/^\d+$/.test(raw) || Number(raw) > 65535) {
-    throw new Error(
-      `Invalid PORT ${JSON.stringify(value)}: expected an integer from 0 to 65535`,
-    );
-  }
-  return Number(raw);
-}
