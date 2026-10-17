@@ -52,24 +52,81 @@ test('the built server lists agents over stdio', async () => {
   }
 });
 
-test('a missing token prints one stderr line and exits 1', async () => {
+test('config errors print one stderr line and exit 1', async () => {
   await access(entry);
-  for (const token of [undefined, ''] as const) {
-    const env: NodeJS.ProcessEnv = {
-      SWITCHBOARD_URL: 'http://127.0.0.1:9',
-    };
-    if (process.env.PATH !== undefined) {
-      env.PATH = process.env.PATH;
-    }
-    if (token !== undefined) {
-      env.SWITCHBOARD_TOKEN = token;
-    }
-    const result = await runServer(env);
-    expect(result.code).toBe(1);
-    expect(result.stdout).toBe('');
-    expect(result.stderr).toBe('SWITCHBOARD_TOKEN is required\n');
+  const secret = 'super-secret-token';
+  const cases: { name: string; env: NodeJS.ProcessEnv; stderr: string }[] = [
+    {
+      name: 'missing token',
+      env: { SWITCHBOARD_URL: 'http://127.0.0.1:9' },
+      stderr: 'SWITCHBOARD_TOKEN is required\n',
+    },
+    {
+      name: 'empty token',
+      env: { SWITCHBOARD_URL: 'http://127.0.0.1:9', SWITCHBOARD_TOKEN: '' },
+      stderr: 'SWITCHBOARD_TOKEN is required\n',
+    },
+    {
+      name: 'missing url',
+      env: { SWITCHBOARD_TOKEN: TOKEN },
+      stderr: 'SWITCHBOARD_URL is required\n',
+    },
+    {
+      name: 'empty url',
+      env: { SWITCHBOARD_URL: '', SWITCHBOARD_TOKEN: TOKEN },
+      stderr: 'SWITCHBOARD_URL is required\n',
+    },
+    {
+      name: 'bad url',
+      env: { SWITCHBOARD_URL: 'not a url', SWITCHBOARD_TOKEN: TOKEN },
+      stderr: 'SWITCHBOARD_URL is invalid\n',
+    },
+    {
+      name: 'url with userinfo',
+      env: {
+        SWITCHBOARD_URL: `http://user:${secret}@127.0.0.1:9`,
+        SWITCHBOARD_TOKEN: TOKEN,
+      },
+      stderr: 'SWITCHBOARD_URL is invalid\n',
+    },
+    {
+      name: 'non-https public url',
+      env: { SWITCHBOARD_URL: 'http://example.com', SWITCHBOARD_TOKEN: TOKEN },
+      stderr: 'SWITCHBOARD_URL must use https\n',
+    },
+    {
+      name: 'non-loopback http url',
+      env: {
+        SWITCHBOARD_URL: 'http://10.1.2.3:3001',
+        SWITCHBOARD_TOKEN: TOKEN,
+      },
+      stderr: 'SWITCHBOARD_URL must use https\n',
+    },
+    {
+      name: 'invalid token',
+      env: {
+        SWITCHBOARD_URL: 'http://127.0.0.1:9',
+        SWITCHBOARD_TOKEN: `${secret}!`,
+      },
+      stderr: 'SWITCHBOARD_TOKEN is invalid\n',
+    },
+  ];
+  for (const configCase of cases) {
+    const result = await runServer(withPath(configCase.env));
+    expect(result.code, configCase.name).toBe(1);
+    expect(result.stdout, configCase.name).toBe('');
+    expect(result.stderr, configCase.name).toBe(configCase.stderr);
+    expect(result.stderr, configCase.name).not.toContain(secret);
+    expect(result.stderr, configCase.name).not.toContain('    at ');
   }
 });
+
+function withPath(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  if (process.env.PATH === undefined) {
+    return env;
+  }
+  return { ...env, PATH: process.env.PATH };
+}
 
 function textOf(result: unknown): string {
   if (typeof result !== 'object' || result === null || !('content' in result)) {

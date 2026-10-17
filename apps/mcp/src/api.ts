@@ -2,12 +2,16 @@ import type {
   AgentSummary,
   InboxMessage,
   InboxPage,
+  MarkedRead,
   ReadReceipt,
   SentMessage,
 } from '@switchboard/shared';
 
-// POST /inbox/read accepts at most 100 ids, so a page is one call or none.
+// POST /inbox/read accepts at most 100 ids, so a page is one batch, retried once.
 const MAX_READ = 100;
+const MARK_READ_ATTEMPTS = 2;
+const MARK_READ_WARNING =
+  'Mark-read could not be confirmed. These messages may show again.';
 const TIMEOUT_MS = 10_000;
 const SAFE_ERRORS = new Set([
   'unauthorized',
@@ -63,6 +67,13 @@ type InboxQuery = {
   after?: string;
 };
 
+export type CheckedInbox = {
+  messages: InboxMessage[];
+  next: string | null;
+  read: string[];
+  warning?: string;
+};
+
 export class SwitchboardClient {
   private readonly url: string;
   private readonly token: string;
@@ -75,8 +86,8 @@ export class SwitchboardClient {
   }
 
   listAgents(): Promise<{ agents: AgentSummary[] }> {
-    return this.request('/agents', { method: 'GET' }).then((result) =>
-      parseAgents(result.body),
+    return this.request('/agents', { method: 'GET' }).then((body) =>
+      parseAgents(body),
     );
   }
 
@@ -84,10 +95,10 @@ export class SwitchboardClient {
     return this.request('/messages', {
       method: 'POST',
       body: { to: input.to, body: input.body },
-    }).then((result) => parseSent(result.body));
+    }).then((body) => parseSent(body));
   }
 
-  async checkInbox(input: InboxQuery): Promise<InboxPage & { read: string[] }> {
+  async checkInbox(input: InboxQuery): Promise<CheckedInbox> {
     const query: Record<string, string> = {
       unread: String(input.unread),
     };
@@ -98,7 +109,7 @@ export class SwitchboardClient {
       query.after = input.after;
     }
     const fetched = await this.request('/inbox', { method: 'GET', query });
-    const page = parseInbox(fetched.body);
+    const page = parseInbox(fetched);
     const ids = page.messages.map((message) => message.id);
     if (ids.length === 0) {
       return { messages: [], next: page.next, read: [] };
@@ -106,22 +117,39 @@ export class SwitchboardClient {
     if (ids.length > MAX_READ) {
       throw new SwitchboardError(400, 'invalid request');
     }
-    const marked = await this.request('/inbox/read', {
-      method: 'POST',
-      body: { ids },
-    });
-    const receipt = parseRead(marked.body);
-    const readIds = new Set(receipt.read.map((id) => id.toLowerCase()));
-    return {
-      messages: page.messages.map((message) => {
-        if (message.readAt !== null || !readIds.has(message.id.toLowerCase())) {
-          return message;
+    const receipt = await this.markRead(ids);
+    if (receipt === undefined) {
+      return {
+        messages: page.messages,
+        next: page.next,
+        read: [],
+        warning: MARK_READ_WARNING,
+      };
+    }
+    return withReadTimes(page, receipt);
+  }
+
+  private async markRead(ids: string[]): Promise<ReadReceipt | undefined> {
+    let unconfirmed = false;
+    for (let attempt = 0; attempt < MARK_READ_ATTEMPTS; attempt += 1) {
+      try {
+        return parseRead(
+          await this.request('/inbox/read', {
+            method: 'POST',
+            body: { ids },
+          }),
+        );
+      } catch (error) {
+        if (!isUnconfirmedMarkRead(error)) {
+          if (unconfirmed) {
+            return undefined;
+          }
+          throw error;
         }
-        return { ...message, readAt: marked.readAt };
-      }),
-      next: page.next,
-      read: receipt.read,
-    };
+        unconfirmed = true;
+      }
+    }
+    return undefined;
   }
 
   private async request(
@@ -131,7 +159,7 @@ export class SwitchboardClient {
       query?: Record<string, string>;
       body?: unknown;
     },
-  ): Promise<{ body: unknown; readAt: string }> {
+  ): Promise<unknown> {
     const url = joinUrl(this.url, path);
     if (options.query !== undefined) {
       for (const [key, value] of Object.entries(options.query)) {
@@ -155,13 +183,14 @@ export class SwitchboardClient {
         signal: AbortSignal.timeout(TIMEOUT_MS),
       });
     } catch {
-      throw new SwitchboardError(
-        0,
-        'api_unreachable',
-        `The Switchboard API at ${this.url} is not reachable. Do not retry in a loop.`,
-      );
+      throw this.unreachable();
     }
-    const text = await response.text();
+    let text: string;
+    try {
+      text = await response.text();
+    } catch {
+      throw this.unreachable();
+    }
     let parsed: unknown;
     if (text !== '') {
       try {
@@ -173,18 +202,48 @@ export class SwitchboardClient {
     if (!response.ok) {
       throw mapApiError(response.status, parsed);
     }
-    return { body: parsed, readAt: readAtFrom(response.headers.get('date')) };
+    return parsed;
+  }
+
+  private unreachable(): SwitchboardError {
+    return new SwitchboardError(
+      0,
+      'api_unreachable',
+      `The Switchboard API at ${this.url} is not reachable. Do not retry in a loop.`,
+    );
   }
 }
 
-function readAtFrom(header: string | null): string {
-  if (header !== null) {
-    const parsed = new Date(header);
-    if (!Number.isNaN(parsed.getTime())) {
-      return parsed.toISOString();
-    }
-  }
-  return new Date().toISOString();
+function isUnconfirmedMarkRead(error: unknown): boolean {
+  // status 200 is a receipt that could not be read; the update may have committed.
+  return (
+    error instanceof SwitchboardError &&
+    (error.code === 'api_unreachable' ||
+      error.status === 200 ||
+      error.status === 502 ||
+      error.status === 504)
+  );
+}
+
+function withReadTimes(page: InboxPage, receipt: ReadReceipt): CheckedInbox {
+  const readIds = new Set(receipt.read.map((id) => id.toLowerCase()));
+  const readAtById = new Map(
+    receipt.marked.map((item) => [item.id.toLowerCase(), item.readAt]),
+  );
+  return {
+    messages: page.messages.map((message) => {
+      if (message.readAt !== null || !readIds.has(message.id.toLowerCase())) {
+        return message;
+      }
+      const readAt = readAtById.get(message.id.toLowerCase());
+      if (readAt === undefined) {
+        return message;
+      }
+      return { ...message, readAt };
+    }),
+    next: page.next,
+    read: receipt.read,
+  };
 }
 
 function joinUrl(base: string, path: string): URL {
@@ -281,9 +340,34 @@ function parseMessage(value: unknown): InboxMessage {
   };
 }
 
+function parseMarked(value: unknown): MarkedRead {
+  if (
+    !isRecord(value) ||
+    typeof value.id !== 'string' ||
+    !(value.readAt === null || typeof value.readAt === 'string')
+  ) {
+    throw new SwitchboardError(200, 'request_failed');
+  }
+  return { id: value.id, readAt: value.readAt };
+}
+
 function parseRead(value: unknown): ReadReceipt {
   if (!isRecord(value) || !isStringArray(value.read)) {
     throw new SwitchboardError(200, 'request_failed');
   }
-  return { read: value.read };
+  if (value.marked === undefined) {
+    return {
+      read: value.read,
+      marked: value.read.map((id) => ({ id, readAt: null })),
+    };
+  }
+  if (!Array.isArray(value.marked)) {
+    throw new SwitchboardError(200, 'request_failed');
+  }
+  const marked = value.marked.map(parseMarked);
+  const times = new Set(marked.map((item) => item.id.toLowerCase()));
+  if (value.read.some((id) => !times.has(id.toLowerCase()))) {
+    throw new SwitchboardError(200, 'request_failed');
+  }
+  return { read: value.read, marked };
 }

@@ -31,6 +31,12 @@ export type InboxPage = {
   next: string | null;
 };
 
+export type MarkedRead = {
+  id: string;
+  readAt: string | null;
+};
+
 export type ReadReceipt = {
   read: string[];
+  marked: MarkedRead[];
 };
