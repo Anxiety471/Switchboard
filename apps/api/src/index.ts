@@ -19,6 +19,7 @@ function shutdown(signal: NodeJS.Signals): void {
   shuttingDown = true;
   app.log.info({ signal }, 'shutting down');
   const forceExit = setTimeout(() => {
+    app.log.error('shutdown timed out; forcing exit');
     process.exit(1);
   }, 5000);
   forceExit.unref();

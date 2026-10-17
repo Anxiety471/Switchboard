@@ -41,6 +41,9 @@ importers:
 
   apps/api:
     dependencies:
+      '@switchboard/shared':
+        specifier: workspace:*
+        version: link:../../packages/shared
       fastify:
         specifier: ^5.12.7
         version: 5.12.7
