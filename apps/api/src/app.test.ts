@@ -236,6 +236,67 @@ test('GET /health survives pg_terminate_backend', async () => {
   }
 });
 
+test('GET /agents returns 503 while agents is exclusively locked', async () => {
+  const lockedApp = buildApp(databaseUrl);
+  const locker = new Client({ connectionString: databaseUrl });
+  try {
+    await lockedApp.migrationsReady;
+    await locker.connect();
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      await locker.query('BEGIN');
+      await locker.query('LOCK TABLE agents IN ACCESS EXCLUSIVE MODE');
+      const lockedAt = Date.now();
+      const pending = lockedApp.inject({
+        method: 'GET',
+        url: '/agents',
+        headers: { authorization: 'Bearer not-a-real-token' },
+      });
+      const responsePromise = pending.then((response) => ({
+        kind: 'response' as const,
+        response,
+      }));
+      try {
+        const outcome = await Promise.race([
+          responsePromise,
+          delay(5000).then(() => ({ kind: 'hung' as const })),
+        ]);
+        if (outcome.kind === 'hung') {
+          void responsePromise.catch(() => undefined);
+          throw new Error(
+            `GET /agents stayed blocked on the agents lock (attempt ${attempt})`,
+          );
+        }
+        const held = Date.now() - lockedAt;
+        if (held < 3100) {
+          await delay(3100 - held);
+        }
+        expect(Date.now() - lockedAt).toBeGreaterThanOrEqual(3000);
+        expect(outcome.response.statusCode).toBe(503);
+        expect(outcome.response.body).toBe('{"error":"database_unavailable"}');
+      } finally {
+        await locker.query('ROLLBACK');
+      }
+    }
+
+    const recovered = await lockedApp.inject({
+      method: 'GET',
+      url: '/agents',
+      headers: { authorization: 'Bearer not-a-real-token' },
+    });
+    expect(recovered.statusCode).toBe(401);
+    expect(recovered.body).toBe('{"error":"unauthorized"}');
+  } finally {
+    await locker.end().catch(() => undefined);
+    await lockedApp.close();
+  }
+}, 40_000);
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
 function freePort(): Promise<number> {
   const server = createServer();
   return new Promise((resolve, reject) => {

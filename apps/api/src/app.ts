@@ -20,7 +20,9 @@ const MAX_INBOX_LIMIT = 200;
 const ONLINE_INTERVAL = '60 seconds';
 const MIGRATION_RETRY_MIN_MS = 200;
 const MIGRATION_RETRY_MAX_MS = 5000;
-const DATABASE_TIMEOUT_MS = 2000;
+const CONNECTION_TIMEOUT_MS = 2000;
+const STATEMENT_TIMEOUT_MS = 2000;
+const QUERY_TIMEOUT_MS = 2500;
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const UUID_PATTERN =
   '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';
@@ -49,6 +51,7 @@ const CONNECTION_ERRORS = new Set([
   '08003',
   '08004',
   '08006',
+  '57014',
   '57P01',
   '57P02',
   '57P03',
@@ -241,24 +244,30 @@ function parseCursor(
   return { createdAt, id };
 }
 
-function isDatabaseUnavailable(error: unknown): boolean {
+function unavailableMessage(error: object): boolean {
+  if (!('message' in error) || typeof error.message !== 'string') {
+    return false;
+  }
+  const message = error.message.toLowerCase();
+  return UNAVAILABLE_MESSAGES.some((part) => message.includes(part));
+}
+
+export function isDatabaseUnavailable(error: unknown): boolean {
   if (typeof error !== 'object' || error === null) {
     return false;
   }
-  if ('code' in error) {
-    const code = error.code;
-    if (typeof code === 'string' && CONNECTION_ERRORS.has(code)) {
+  const code = pgField(error, 'code');
+  if (code !== undefined) {
+    if (CONNECTION_ERRORS.has(code)) {
       return true;
     }
-  }
-  if ('message' in error && typeof error.message === 'string') {
-    const message = error.message.toLowerCase();
-    if (UNAVAILABLE_MESSAGES.some((part) => message.includes(part))) {
-      return true;
-    }
+  } else if (unavailableMessage(error)) {
+    return true;
   }
   if ('errors' in error && Array.isArray(error.errors)) {
-    return error.errors.some((item) => isDatabaseUnavailable(item));
+    if (error.errors.some((item) => isDatabaseUnavailable(item))) {
+      return true;
+    }
   }
   if ('cause' in error && error.cause !== undefined && error.cause !== error) {
     return isDatabaseUnavailable(error.cause);
@@ -278,9 +287,9 @@ function registrationHeader(headers: IncomingHttpHeaders): string {
 export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
   const pool = new Pool({
     connectionString: databaseUrl,
-    connectionTimeoutMillis: DATABASE_TIMEOUT_MS,
-    query_timeout: DATABASE_TIMEOUT_MS,
-    statement_timeout: DATABASE_TIMEOUT_MS,
+    connectionTimeoutMillis: CONNECTION_TIMEOUT_MS,
+    query_timeout: QUERY_TIMEOUT_MS,
+    statement_timeout: STATEMENT_TIMEOUT_MS,
     max: options?.max ?? 10,
   });
   const logging = options?.logger === true || options?.logStream !== undefined;
