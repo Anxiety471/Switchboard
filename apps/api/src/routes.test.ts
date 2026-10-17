@@ -104,6 +104,8 @@ test('migration creates agents, messages, and per-recipient receipts', async () 
   );
   expect(tables.rows.map((row) => row.table_name)).toEqual([
     'agents',
+    'dashboard_notices',
+    'dashboard_sessions',
     'message_receipts',
     'messages',
     'schema_migrations',
@@ -284,13 +286,30 @@ test('missing token is unauthorized on protected routes', async () => {
       method: 'POST' as const,
       url: '/dashboard/agents/00000000-0000-4000-8000-000000000001/token/revoke',
     },
-    { method: 'GET' as const, url: '/missing' },
+    { method: 'POST' as const, url: '/dashboard/sessions' },
+    {
+      method: 'GET' as const,
+      url: `/dashboard/sessions/${'a'.repeat(43)}`,
+    },
+    {
+      method: 'DELETE' as const,
+      url: `/dashboard/sessions/${'a'.repeat(43)}`,
+    },
+    {
+      method: 'POST' as const,
+      url: `/dashboard/sessions/${'a'.repeat(43)}/notices`,
+      payload: { type: 'failure', failure: 'unauthorized' },
+    },
   ];
   for (const route of cases) {
     const response = await app.inject(route);
     expect(response.statusCode, route.url).toBe(401);
     expect(response.json()).toEqual({ error: 'unauthorized' });
   }
+
+  const missing = await app.inject({ method: 'GET', url: '/missing' });
+  expect(missing.statusCode).toBe(404);
+  expect(missing.json()).toEqual({ error: 'not found' });
 
   const malformed = ['Token abc', 'Bearer', 'Bearer ', 'bearer not base64!'];
   for (const authorization of malformed) {

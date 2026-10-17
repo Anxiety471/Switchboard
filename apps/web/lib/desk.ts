@@ -1,16 +1,11 @@
-import {
-  createHash,
-  createHmac,
-  randomBytes,
-  timingSafeEqual,
-} from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import type { DeskFailure } from './ledger';
 
 export const DESK_COOKIE = 'switchboard_desk';
 export const FLASH_COOKIE = 'switchboard_flash';
 export const THEME_COOKIE = 'switchboard_theme';
 
-const FLASH_TTL_MS = 120_000;
+const FORM_CSRF_TTL_MS = 2 * 60 * 60 * 1000;
 
 export type CookieOptions = {
   httpOnly: boolean;
@@ -25,21 +20,13 @@ export type Flash =
   | { type: 'revoked'; name: string }
   | { type: 'failure'; failure: DeskFailure };
 
-type FlashEntry = {
-  flash: Flash;
-  expires: number;
-};
+export class ReturnPathError extends Error {
+  readonly status = 400 as const;
 
-const FLASH_STORE = Symbol.for('switchboard.desk.flashes');
-
-function flashStore(): Map<string, FlashEntry> {
-  const host = globalThis as typeof globalThis & {
-    [FLASH_STORE]?: Map<string, FlashEntry>;
-  };
-  // Route handlers and pages are separate bundles, so a module-level Map
-  // is not shared. One process-wide store keeps the one-time slip readable.
-  host[FLASH_STORE] ??= new Map();
-  return host[FLASH_STORE];
+  constructor() {
+    super('invalid return path');
+    this.name = 'ReturnPathError';
+  }
 }
 
 export function secretsEqual(expected: string, provided: string): boolean {
@@ -48,26 +35,43 @@ export function secretsEqual(expected: string, provided: string): boolean {
   return timingSafeEqual(left, right);
 }
 
-export function deskSessionValue(secret: string): string {
-  return createHmac('sha256', secret)
-    .update('switchboard-desk-v1')
+export function issueFormCsrf(secret: string, now = Date.now()): string {
+  const expires = now + FORM_CSRF_TTL_MS;
+  const mac = createHmac('sha256', secret)
+    .update(`form.${expires}`)
     .digest('base64url');
+  return `${expires}.${mac}`;
 }
 
-export function deskSessionValid(
+export function formCsrfValid(
   secret: string,
-  value: string | undefined,
+  token: string,
+  now = Date.now(),
 ): boolean {
   if (secret === '') {
     return false;
   }
-  const expected = createHash('sha256')
-    .update(deskSessionValue(secret))
-    .digest();
-  const actual = createHash('sha256')
-    .update(value ?? '')
-    .digest();
-  return timingSafeEqual(expected, actual);
+  const dot = token.indexOf('.');
+  if (dot <= 0) {
+    return false;
+  }
+  const expiresText = token.slice(0, dot);
+  const mac = token.slice(dot + 1);
+  if (!/^[0-9]+$/.test(expiresText) || !/^[A-Za-z0-9_-]+$/.test(mac)) {
+    return false;
+  }
+  const expires = Number(expiresText);
+  if (
+    !Number.isSafeInteger(expires) ||
+    expires <= now ||
+    expires > now + FORM_CSRF_TTL_MS + 60_000
+  ) {
+    return false;
+  }
+  const expected = createHmac('sha256', secret)
+    .update(`form.${expires}`)
+    .digest('base64url');
+  return secretsEqual(expected, mac);
 }
 
 export function themeFromCookie(
@@ -109,46 +113,62 @@ export function themeCookie(secure: boolean): CookieOptions {
   };
 }
 
+export function serializeCookie(
+  name: string,
+  value: string,
+  options: CookieOptions,
+): string {
+  const parts = [
+    `${name}=${value}`,
+    `Path=${options.path}`,
+    `Max-Age=${options.maxAge}`,
+    'SameSite=Lax',
+  ];
+  if (options.httpOnly) {
+    parts.push('HttpOnly');
+  }
+  if (options.secure) {
+    parts.push('Secure');
+  }
+  return parts.join('; ');
+}
+
+export function clearCookie(name: string, secure: boolean): string {
+  return serializeCookie(name, '', {
+    httpOnly: true,
+    sameSite: 'lax',
+    path: '/',
+    secure,
+    maxAge: 0,
+  });
+}
+
+function hasControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x1f || code === 0x7f) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function safeReturnPath(value: FormDataEntryValue | null): string {
-  if (typeof value !== 'string' || value.length > 2048) {
+  if (typeof value !== 'string') {
     return '/';
   }
+  if (hasControlCharacter(value)) {
+    throw new ReturnPathError();
+  }
   if (
+    value.length > 2048 ||
     !value.startsWith('/') ||
     value.startsWith('//') ||
-    value.startsWith('/\\')
+    value.startsWith('/\\') ||
+    value.includes('://') ||
+    value.includes('\\')
   ) {
     return '/';
   }
-  if (value.includes('://') || value.includes('\\') || value.includes('\n')) {
-    return '/';
-  }
   return value;
-}
-
-function prune(store: Map<string, FlashEntry>, now: number): void {
-  for (const [key, entry] of store) {
-    if (entry.expires <= now) {
-      store.delete(key);
-    }
-  }
-}
-
-export function stageFlash(flash: Flash): string {
-  const store = flashStore();
-  const now = Date.now();
-  prune(store, now);
-  const id = randomBytes(18).toString('base64url');
-  store.set(id, { flash, expires: now + FLASH_TTL_MS });
-  return id;
-}
-
-export function takeFlash(id: string): Flash | undefined {
-  const store = flashStore();
-  const entry = store.get(id);
-  store.delete(id);
-  if (entry === undefined || entry.expires <= Date.now()) {
-    return undefined;
-  }
-  return entry.flash;
 }

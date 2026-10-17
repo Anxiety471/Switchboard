@@ -108,19 +108,6 @@ type InboxQuery = {
   after?: string;
 };
 
-function requestPath(url: string): string {
-  const query = url.indexOf('?');
-  return query === -1 ? url : url.slice(0, query);
-}
-
-function isPublicRoute(method: string, url: string): boolean {
-  const path = requestPath(url);
-  if (path === '/health') {
-    return true;
-  }
-  return method === 'POST' && path === '/agents';
-}
-
 function headersForLog(headers: IncomingHttpHeaders): Record<string, unknown> {
   const copy: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(headers)) {
@@ -243,16 +230,6 @@ function unavailableLog(error: unknown): { err: unknown; code?: string } {
 function registrationHeader(headers: IncomingHttpHeaders): string {
   const header = headers['x-registration-secret'];
   return typeof header === 'string' ? header : '';
-}
-
-function dashboardHeader(headers: IncomingHttpHeaders): string {
-  const header = headers['x-dashboard-secret'];
-  return typeof header === 'string' ? header : '';
-}
-
-function isDashboardPath(url: string): boolean {
-  const path = requestPath(url);
-  return path === '/dashboard' || path.startsWith('/dashboard/');
 }
 
 export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
@@ -403,57 +380,6 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
     return reply.code(404).send({ error: 'not found' });
   });
 
-  app.addHook('onRequest', async (request, reply) => {
-    if (isPublicRoute(request.method, request.url)) {
-      return;
-    }
-    if (isDashboardPath(request.url)) {
-      if (
-        dashboardSecret === undefined ||
-        dashboardSecret === '' ||
-        !secretsEqual(dashboardSecret, dashboardHeader(request.headers))
-      ) {
-        return reply.code(401).send({ error: 'unauthorized' });
-      }
-      return;
-    }
-    const token = bearerToken(request.headers.authorization);
-    if (token === undefined) {
-      return reply.code(401).send({ error: 'unauthorized' });
-    }
-    let result;
-    try {
-      result = await pool.query<{ id: string; name: string }>(
-        `WITH touched AS (
-         UPDATE agents
-         SET last_seen_at = clock_timestamp()
-         WHERE token_hash = $1
-           AND token_revoked = false
-           AND (
-             last_seen_at IS NULL
-             OR last_seen_at < clock_timestamp() - interval '10 seconds'
-           )
-       )
-       SELECT id, name
-       FROM agents
-       WHERE token_hash = $1
-         AND token_revoked = false`,
-        [hashToken(token)],
-      );
-    } catch (error) {
-      if (isDatabaseUnavailable(error)) {
-        app.log.error(unavailableLog(error), 'database auth check failed');
-        return reply.code(503).send(databaseUnavailableBody());
-      }
-      throw error;
-    }
-    const row = result.rows[0];
-    if (row === undefined) {
-      return reply.code(401).send({ error: 'unauthorized' });
-    }
-    request.agent = { id: row.id, name: row.name };
-  });
-
   app.get('/health', async (_request, reply) => {
     if (!migrated) {
       return reply.code(503).send({ ok: false });
@@ -537,27 +463,67 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
     },
   );
 
-  app.get(
-    '/agents',
-    {
-      schema: {
-        response: {
-          200: {
-            type: 'object',
-            additionalProperties: false,
-            required: ['agents'],
-            properties: {
-              agents: {
-                type: 'array',
-                items: {
-                  type: 'object',
-                  additionalProperties: false,
-                  required: ['id', 'name', 'online', 'lastSeenAt'],
-                  properties: {
-                    id: { type: 'string' },
-                    name: { type: 'string' },
-                    online: { type: 'boolean' },
-                    lastSeenAt: { type: ['string', 'null'] },
+  app.register(async (agentRoutes) => {
+    agentRoutes.addHook('onRequest', async (request, reply) => {
+      const token = bearerToken(request.headers.authorization);
+      if (token === undefined) {
+        return reply.code(401).send({ error: 'unauthorized' });
+      }
+      let result;
+      try {
+        result = await pool.query<{ id: string; name: string }>(
+          `WITH touched AS (
+           UPDATE agents
+           SET last_seen_at = clock_timestamp()
+           WHERE token_hash = $1
+             AND token_revoked = false
+             AND (
+               last_seen_at IS NULL
+               OR last_seen_at < clock_timestamp() - interval '10 seconds'
+             )
+         )
+         SELECT id, name
+         FROM agents
+         WHERE token_hash = $1
+           AND token_revoked = false`,
+          [hashToken(token)],
+        );
+      } catch (error) {
+        if (isDatabaseUnavailable(error)) {
+          app.log.error(unavailableLog(error), 'database auth check failed');
+          return reply.code(503).send(databaseUnavailableBody());
+        }
+        throw error;
+      }
+      const row = result.rows[0];
+      if (row === undefined) {
+        return reply.code(401).send({ error: 'unauthorized' });
+      }
+      request.agent = { id: row.id, name: row.name };
+    });
+
+    agentRoutes.get(
+      '/agents',
+      {
+        schema: {
+          response: {
+            200: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['agents'],
+              properties: {
+                agents: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    additionalProperties: false,
+                    required: ['id', 'name', 'online', 'lastSeenAt'],
+                    properties: {
+                      id: { type: 'string' },
+                      name: { type: 'string' },
+                      online: { type: 'boolean' },
+                      lastSeenAt: { type: ['string', 'null'] },
+                    },
                   },
                 },
               },
@@ -565,16 +531,15 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
           },
         },
       },
-    },
-    async (request) => {
-      caller(request);
-      const result = await pool.query<{
-        id: string;
-        name: string;
-        online: boolean;
-        last_seen_at: Date | string | null;
-      }>(
-        `SELECT id,
+      async (request) => {
+        caller(request);
+        const result = await pool.query<{
+          id: string;
+          name: string;
+          online: boolean;
+          last_seen_at: Date | string | null;
+        }>(
+          `SELECT id,
                 name,
                 last_seen_at,
                 (
@@ -583,59 +548,59 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
                 ) AS online
          FROM agents
          ORDER BY name ASC`,
-        [ONLINE_INTERVAL],
-      );
-      const agents: AgentSummary[] = result.rows.map((row) => ({
-        id: row.id,
-        name: row.name,
-        online: row.online,
-        lastSeenAt: isoTime(row.last_seen_at),
-      }));
-      return { agents };
-    },
-  );
+          [ONLINE_INTERVAL],
+        );
+        const agents: AgentSummary[] = result.rows.map((row) => ({
+          id: row.id,
+          name: row.name,
+          online: row.online,
+          lastSeenAt: isoTime(row.last_seen_at),
+        }));
+        return { agents };
+      },
+    );
 
-  app.post<{ Body: MessageBody }>(
-    '/messages',
-    {
-      schema: {
-        body: {
-          type: 'object',
-          additionalProperties: false,
-          required: ['to', 'body'],
-          properties: {
-            to: { type: 'string', minLength: 1, maxLength: 64 },
-            body: { type: 'string', minLength: 1, maxLength: MAX_BODY_BYTES },
-          },
-        },
-        response: {
-          201: {
+    agentRoutes.post<{ Body: MessageBody }>(
+      '/messages',
+      {
+        schema: {
+          body: {
             type: 'object',
             additionalProperties: false,
-            required: ['id'],
+            required: ['to', 'body'],
             properties: {
-              id: { type: 'string' },
+              to: { type: 'string', minLength: 1, maxLength: 64 },
+              body: { type: 'string', minLength: 1, maxLength: MAX_BODY_BYTES },
+            },
+          },
+          response: {
+            201: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['id'],
+              properties: {
+                id: { type: 'string' },
+              },
             },
           },
         },
       },
-    },
-    async (request, reply) => {
-      const sender = caller(request);
-      const { to, body } = request.body;
-      if (
-        body.includes('\0') ||
-        Buffer.byteLength(body, 'utf8') > MAX_BODY_BYTES
-      ) {
-        return reply.code(400).send({ error: 'invalid request' });
-      }
-      const recipientId = await resolveRecipient(pool, reply, sender, to);
-      if (recipientId === undefined) {
-        return reply;
-      }
-      try {
-        const result = await pool.query<{ id: string }>(
-          `WITH inserted AS (
+      async (request, reply) => {
+        const sender = caller(request);
+        const { to, body } = request.body;
+        if (
+          body.includes('\0') ||
+          Buffer.byteLength(body, 'utf8') > MAX_BODY_BYTES
+        ) {
+          return reply.code(400).send({ error: 'invalid request' });
+        }
+        const recipientId = await resolveRecipient(pool, reply, sender, to);
+        if (recipientId === undefined) {
+          return reply;
+        }
+        try {
+          const result = await pool.query<{ id: string }>(
+            `WITH inserted AS (
              INSERT INTO messages (from_agent, to_agent, body)
              VALUES ($1::uuid, $2::uuid, $3)
              RETURNING id, from_agent
@@ -651,119 +616,127 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
              RETURNING message_id
            )
            SELECT id FROM inserted`,
-          [sender.id, recipientId, body],
-        );
-        const row = requiredRow(result.rows);
-        const payload: SentMessage = { id: row.id };
-        return reply.code(201).send(payload);
-      } catch (error) {
-        if (pgField(error, 'code') === '23503') {
-          return reply.code(404).send({ error: 'recipient not found' });
+            [sender.id, recipientId, body],
+          );
+          const row = requiredRow(result.rows);
+          const payload: SentMessage = { id: row.id };
+          return reply.code(201).send(payload);
+        } catch (error) {
+          if (pgField(error, 'code') === '23503') {
+            return reply.code(404).send({ error: 'recipient not found' });
+          }
+          if (pgField(error, 'code') === '23514') {
+            return reply.code(400).send({ error: 'invalid request' });
+          }
+          throw error;
         }
-        if (pgField(error, 'code') === '23514') {
+      },
+    );
+
+    agentRoutes.get<{ Querystring: InboxQuery }>(
+      '/inbox',
+      {
+        schema: {
+          querystring: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              unread: { type: 'string', enum: ['true', 'false'] },
+              limit: { type: 'string', pattern: '^[1-9][0-9]{0,2}$' },
+              after: { type: 'string', minLength: 1, maxLength: 80 },
+            },
+          },
+          response: {
+            200: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['messages', 'next'],
+              properties: {
+                messages: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    additionalProperties: false,
+                    required: [
+                      'id',
+                      'from',
+                      'to',
+                      'body',
+                      'createdAt',
+                      'readAt',
+                    ],
+                    properties: {
+                      id: { type: 'string' },
+                      from: { type: 'string' },
+                      to: { type: 'string' },
+                      body: { type: 'string' },
+                      createdAt: { type: 'string' },
+                      readAt: { type: ['string', 'null'] },
+                    },
+                  },
+                },
+                next: { type: ['string', 'null'] },
+              },
+            },
+          },
+        },
+      },
+      async (request, reply) => {
+        const agent = caller(request);
+        const limit = inboxLimit(request.query.limit);
+        const cursor = parseCursor(request.query.after);
+        if (limit === undefined || cursor === undefined) {
           return reply.code(400).send({ error: 'invalid request' });
         }
-        throw error;
-      }
-    },
-  );
+        return readInbox(pool, agent.id, {
+          unreadOnly: request.query.unread === 'true',
+          cursor,
+          limit,
+        });
+      },
+    );
 
-  app.get<{ Querystring: InboxQuery }>(
-    '/inbox',
-    {
-      schema: {
-        querystring: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            unread: { type: 'string', enum: ['true', 'false'] },
-            limit: { type: 'string', pattern: '^[1-9][0-9]{0,2}$' },
-            after: { type: 'string', minLength: 1, maxLength: 80 },
-          },
-        },
-        response: {
-          200: {
+    agentRoutes.post<{ Body: ReadBody }>(
+      '/inbox/read',
+      {
+        schema: {
+          body: {
             type: 'object',
             additionalProperties: false,
-            required: ['messages', 'next'],
+            required: ['ids'],
             properties: {
-              messages: {
+              ids: {
                 type: 'array',
+                maxItems: MAX_READ_IDS,
                 items: {
-                  type: 'object',
-                  additionalProperties: false,
-                  required: ['id', 'from', 'to', 'body', 'createdAt', 'readAt'],
-                  properties: {
-                    id: { type: 'string' },
-                    from: { type: 'string' },
-                    to: { type: 'string' },
-                    body: { type: 'string' },
-                    createdAt: { type: 'string' },
-                    readAt: { type: ['string', 'null'] },
-                  },
+                  type: 'string',
+                  minLength: 36,
+                  maxLength: 36,
+                  pattern: UUID_PATTERN,
                 },
               },
-              next: { type: ['string', 'null'] },
             },
           },
-        },
-      },
-    },
-    async (request, reply) => {
-      const agent = caller(request);
-      const limit = inboxLimit(request.query.limit);
-      const cursor = parseCursor(request.query.after);
-      if (limit === undefined || cursor === undefined) {
-        return reply.code(400).send({ error: 'invalid request' });
-      }
-      return readInbox(pool, agent.id, {
-        unreadOnly: request.query.unread === 'true',
-        cursor,
-        limit,
-      });
-    },
-  );
-
-  app.post<{ Body: ReadBody }>(
-    '/inbox/read',
-    {
-      schema: {
-        body: {
-          type: 'object',
-          additionalProperties: false,
-          required: ['ids'],
-          properties: {
-            ids: {
-              type: 'array',
-              maxItems: MAX_READ_IDS,
-              items: {
-                type: 'string',
-                minLength: 36,
-                maxLength: 36,
-                pattern: UUID_PATTERN,
-              },
-            },
-          },
-        },
-        response: {
-          200: {
-            type: 'object',
-            additionalProperties: false,
-            required: ['read', 'marked'],
-            properties: {
-              read: {
-                type: 'array',
-                items: { type: 'string' },
-              },
-              marked: {
-                type: 'array',
-                items: {
-                  type: 'object',
-                  additionalProperties: false,
-                  required: ['id', 'readAt'],
-                  properties: {
-                    id: { type: 'string' },
-                    readAt: { type: ['string', 'null'] },
+          response: {
+            200: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['read', 'marked'],
+              properties: {
+                read: {
+                  type: 'array',
+                  items: { type: 'string' },
+                },
+                marked: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    additionalProperties: false,
+                    required: ['id', 'readAt'],
+                    properties: {
+                      id: { type: 'string' },
+                      readAt: { type: ['string', 'null'] },
+                    },
                   },
                 },
               },
@@ -771,41 +744,41 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
           },
         },
       },
-    },
-    async (request) => {
-      const agent = caller(request);
-      const result = await pool.query<{
-        message_id: string;
-        read_at: Date | string | null;
-      }>(
-        `UPDATE message_receipts
+      async (request) => {
+        const agent = caller(request);
+        const result = await pool.query<{
+          message_id: string;
+          read_at: Date | string | null;
+        }>(
+          `UPDATE message_receipts
          SET read_at = COALESCE(read_at, clock_timestamp())
          WHERE agent_id = $1::uuid
            AND message_id IN (
              SELECT value::uuid FROM unnest($2::text[]) AS value
            )
          RETURNING message_id, read_at`,
-        [agent.id, request.body.ids],
-      );
-      const byId = new Map(
-        result.rows.map((row) => [row.message_id.toLowerCase(), row]),
-      );
-      const marked = request.body.ids.flatMap((id) => {
-        const row = byId.get(id.toLowerCase());
-        if (row === undefined) {
-          return [];
-        }
-        return [{ id: row.message_id, readAt: requiredIsoTime(row.read_at) }];
-      });
-      const body: ReadReceipt = {
-        read: marked.map((item) => item.id),
-        marked,
-      };
-      return body;
-    },
-  );
+          [agent.id, request.body.ids],
+        );
+        const byId = new Map(
+          result.rows.map((row) => [row.message_id.toLowerCase(), row]),
+        );
+        const marked = request.body.ids.flatMap((id) => {
+          const row = byId.get(id.toLowerCase());
+          if (row === undefined) {
+            return [];
+          }
+          return [{ id: row.message_id, readAt: requiredIsoTime(row.read_at) }];
+        });
+        const body: ReadReceipt = {
+          read: marked.map((item) => item.id),
+          marked,
+        };
+        return body;
+      },
+    );
+  });
 
-  registerDashboardRoutes(app, pool, ONLINE_INTERVAL);
+  registerDashboardRoutes(app, pool, ONLINE_INTERVAL, dashboardSecret);
 
   const migrationTask = runMigrations();
 

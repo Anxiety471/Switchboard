@@ -5,13 +5,16 @@ import {
   DESK_COOKIE,
   FLASH_COOKIE,
   THEME_COOKIE,
-  deskSessionValid,
-  takeFlash,
+  issueFormCsrf,
   themeFromCookie,
+  type Flash,
 } from '../lib/desk';
 import { parseLedgerQuery } from '../lib/href';
 import {
   loadLedger,
+  readDeskSession,
+  takeDeskNotice,
+  type DeskFailure,
   type DeskResult,
   type LedgerSnapshot,
 } from '../lib/ledger';
@@ -20,9 +23,35 @@ export const dynamic = 'force-dynamic';
 
 type SearchParams = Record<string, string | string[] | undefined>;
 
-function envString(name: string): string {
-  const value = process.env[name];
-  return typeof value === 'string' ? value : '';
+function isFailure(value: string): value is DeskFailure {
+  return (
+    value === 'unconfigured' ||
+    value === 'unreachable' ||
+    value === 'database_unavailable' ||
+    value === 'unauthorized' ||
+    value === 'invalid' ||
+    value === 'conflict' ||
+    value === 'not_found' ||
+    value === 'failed' ||
+    value === 'unknown'
+  );
+}
+
+function errorFlash(params: SearchParams): Flash | undefined {
+  const raw = params.error;
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (value === undefined || !isFailure(value)) {
+    return undefined;
+  }
+  return { type: 'failure', failure: value };
+}
+
+function sessionMissing(failure: DeskFailure): boolean {
+  return (
+    failure === 'not_found' ||
+    failure === 'invalid' ||
+    failure === 'unauthorized'
+  );
 }
 
 export default async function HomePage(props: {
@@ -32,17 +61,68 @@ export default async function HomePage(props: {
   const query = parseLedgerQuery(params);
   const jar = await cookies();
   const theme = themeFromCookie(jar.get(THEME_COOKIE)?.value);
-  const flashId = jar.get(FLASH_COOKIE)?.value;
-  const flash = flashId === undefined ? undefined : takeFlash(flashId);
-  const secret = envString('DASHBOARD_SECRET');
   const config = readDeskConfig(process.env);
-  const shell = { theme, query, flash };
+  const banner = errorFlash(params);
 
-  if (secret === '' || config === undefined) {
-    return <LedgerPage {...shell} model={{ kind: 'unconfigured' }} />;
+  if (config === undefined) {
+    return (
+      <LedgerPage
+        theme={theme}
+        query={query}
+        flash={banner}
+        csrf=""
+        model={{ kind: 'unconfigured' }}
+      />
+    );
   }
-  if (!deskSessionValid(secret, jar.get(DESK_COOKIE)?.value)) {
-    return <LedgerPage {...shell} model={{ kind: 'login' }} />;
+
+  const formCsrf = issueFormCsrf(config.secret);
+  const sessionId = jar.get(DESK_COOKIE)?.value;
+  if (sessionId === undefined || sessionId === '') {
+    return (
+      <LedgerPage
+        theme={theme}
+        query={query}
+        flash={banner}
+        csrf={formCsrf}
+        model={{ kind: 'login' }}
+      />
+    );
+  }
+
+  const session = await readDeskSession(config, sessionId);
+  if (!session.ok) {
+    if (sessionMissing(session.failure)) {
+      return (
+        <LedgerPage
+          theme={theme}
+          query={query}
+          flash={banner}
+          csrf={formCsrf}
+          model={{ kind: 'login' }}
+        />
+      );
+    }
+    return (
+      <LedgerPage
+        theme={theme}
+        query={query}
+        flash={banner}
+        csrf={formCsrf}
+        model={{ kind: 'desk', result: session }}
+      />
+    );
+  }
+
+  let flash = banner;
+  const noticeId = jar.get(FLASH_COOKIE)?.value;
+  if (noticeId !== undefined && noticeId !== '') {
+    const taken = await takeDeskNotice(config, sessionId, noticeId);
+    if (taken.ok) {
+      flash = taken.value;
+    } else if (taken.failure === 'unknown') {
+      flash = { type: 'failure', failure: 'unknown' };
+    }
   }
 
   let result: DeskResult<LedgerSnapshot>;
@@ -55,5 +135,13 @@ export default async function HomePage(props: {
   } catch {
     result = { ok: false, failure: 'unreachable' };
   }
-  return <LedgerPage {...shell} model={{ kind: 'desk', result }} />;
+  return (
+    <LedgerPage
+      theme={theme}
+      query={query}
+      flash={flash}
+      csrf={session.value.csrfToken}
+      model={{ kind: 'desk', result }}
+    />
+  );
 }

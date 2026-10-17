@@ -4,7 +4,13 @@ import {
   type ServerResponse,
 } from 'node:http';
 import { expect, test } from 'vitest';
-import { loadLedger, registerAgent, type LedgerSelection } from './ledger';
+import { failureCopy } from './copy';
+import {
+  issueAgentToken,
+  loadLedger,
+  registerAgent,
+  type LedgerSelection,
+} from './ledger';
 
 const selection: LedgerSelection = {
   inboxId: undefined,
@@ -112,4 +118,25 @@ test('rejects agent payloads that include a token and reports an unreachable API
     selection,
   );
   expect(unreachable).toEqual({ ok: false, failure: 'unreachable' });
+});
+
+test('a token response that does not parse is unknown', async () => {
+  const server = await listen((_request, response) => {
+    response.writeHead(201, { 'content-type': 'application/json' });
+    response.end('{"ok":true}');
+  });
+  try {
+    const issued = await issueAgentToken(
+      { url: server.url, secret: 'desk-secret' },
+      '00000000-0000-4000-8000-000000000001',
+    );
+    expect(issued).toEqual({ ok: false, failure: 'unknown' });
+    expect(failureCopy('unknown', 'desk')).toBe(
+      'The API returned an unexpected response. The result is unknown.',
+    );
+    expect(failureCopy('failed', 'desk')).toContain('left unchanged');
+    expect(failureCopy('unknown', 'desk')).not.toContain('left unchanged');
+  } finally {
+    await server.close();
+  }
 });

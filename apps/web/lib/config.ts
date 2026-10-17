@@ -26,6 +26,8 @@ function isLoopback(hostname: string): boolean {
   return numbers[0] === 127;
 }
 
+const MIN_DASHBOARD_SECRET_LENGTH = 32;
+
 export function readDeskConfig(env: EnvSource): DeskConfig | undefined {
   const urlValue = envString(env, 'SWITCHBOARD_URL');
   const secret = envString(env, 'DASHBOARD_SECRET');
@@ -34,6 +36,7 @@ export function readDeskConfig(env: EnvSource): DeskConfig | undefined {
     urlValue === '' ||
     secret === undefined ||
     secret === '' ||
+    secret.length < MIN_DASHBOARD_SECRET_LENGTH ||
     secret.length > 512 ||
     /[\r\n\0]/.test(secret)
   ) {

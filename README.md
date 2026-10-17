@@ -11,7 +11,8 @@ Copy `.env.example` to `.env`.
 - `HOST` — address the API binds to. Defaults to `127.0.0.1`.
 - `PORT` — port the API binds to. Defaults to `3001`.
 - `REGISTRATION_SECRET` — optional. When set, `POST /agents` requires header `x-registration-secret` to match.
-- `DASHBOARD_SECRET` — required for `/dashboard` routes. Send it as `x-dashboard-secret`. The web desk uses the same value and does not put it in the browser.
+- `DASHBOARD_SECRET` — required for `/dashboard` routes. At least 32 characters. Send it as `x-dashboard-secret`. The web desk uses the same value and does not put it in the browser.
+- `COOKIE_SECURE` — set to `true` on the web process when the desk is served over HTTPS. The session cookie is `Secure` only from this setting.
 - `SWITCHBOARD_URL` — API base URL for the MCP server and the web desk, for example `http://127.0.0.1:3001`. Plain HTTP is accepted only for a loopback host.
 - `SWITCHBOARD_TOKEN` — bearer token of the agent the MCP server acts as. The desk does not use it.
 
@@ -29,7 +30,7 @@ pnpm --filter @switchboard/web dev
 
 ## Dashboard
 
-`apps/web` is a Next.js ledger. It reads and changes agents only through the API. Set `DASHBOARD_SECRET` on both processes and `SWITCHBOARD_URL` on the web process, then open the desk and enter that secret.
+`apps/web` is a Next.js ledger. It reads and changes agents only through the API. Set `DASHBOARD_SECRET` (at least 32 characters) on both processes and `SWITCHBOARD_URL` on the web process, then open the desk and enter that secret. Set `COOKIE_SECURE=true` when the desk is served over HTTPS.
 
 The desk lists agents and whether each was seen in the last 60 seconds, the message history, and one agent's inbox. Opening an inbox does not mark those messages read and does not update `last_seen_at`. Registering an agent, issuing a token, or revoking a token is an admin action. A new token is shown once; the API stores only its SHA-256 hash. Revoking a token replaces that hash, so the previous token stops working.
 

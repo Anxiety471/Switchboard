@@ -59,8 +59,10 @@ const snapshot: LedgerSnapshot = {
   inboxReset: false,
 };
 
-function html(props: LedgerPageProps): string {
-  return renderToStaticMarkup(<LedgerPage {...props} />);
+function html(
+  props: Omit<LedgerPageProps, 'csrf'> & { csrf?: string },
+): string {
+  return renderToStaticMarkup(<LedgerPage csrf="csrf-token" {...props} />);
 }
 
 test('renders the ledger, escapes message bodies, and hides stored tokens', () => {
@@ -88,6 +90,8 @@ test('renders the ledger, escapes message bodies, and hides stored tokens', () =
   expect(markup).not.toContain('<script>alert');
   expect(markup).not.toContain('desk-secret');
   expect(markup).toContain('action="/desk"');
+  expect(markup).toContain('name="csrf"');
+  expect(markup).toContain('value="csrf-token"');
   const pattern = markup.match(/pattern="([^"]+)"/)?.[1] ?? '';
   expect(pattern).toBe('[A-Za-z0-9][A-Za-z0-9_\\-]*');
   expect(() => new RegExp(pattern, 'v')).not.toThrow();

@@ -1,13 +1,5 @@
 import { Client } from 'pg';
 import { afterAll, beforeAll, beforeEach, expect, test } from 'vitest';
-import { readDeskConfig } from '../../web/lib/config.js';
-import {
-  issueAgentToken,
-  loadLedger,
-  registerAgent,
-  revokeAgentToken,
-  type LedgerSelection,
-} from '../../web/lib/ledger.js';
 import { buildApp } from './app.js';
 import { assertTestDatabaseUrl } from './test-helpers/test-database.js';
 
@@ -15,11 +7,6 @@ const SECRET = 'integration-desk-secret';
 const databaseUrl = assertTestDatabaseUrl(process.env.TEST_DATABASE_URL);
 const app = buildApp(databaseUrl, { dashboardSecret: SECRET });
 const admin = new Client({ connectionString: databaseUrl });
-const selection: LedgerSelection = {
-  inboxId: undefined,
-  historyAfter: undefined,
-  inboxAfter: undefined,
-};
 
 let baseUrl = '';
 
@@ -39,58 +26,75 @@ afterAll(async () => {
   await app.close();
 });
 
-function configFor(url: string, secret = SECRET) {
-  const config = readDeskConfig({
-    SWITCHBOARD_URL: url,
-    DASHBOARD_SECRET: secret,
-  });
-  if (config === undefined) {
-    throw new Error('expected a desk config');
-  }
-  return config;
+function desk(secret = SECRET): Record<string, string> {
+  return { 'x-dashboard-secret': secret, accept: 'application/json' };
 }
 
-test('the web client registers, reads, and rotates tokens through the API', async () => {
-  const config = configFor(baseUrl);
-  const alpha = await registerAgent(config, 'alpha');
-  const beta = await registerAgent(config, 'beta');
-  expect(alpha.ok).toBe(true);
-  expect(beta.ok).toBe(true);
-  if (!alpha.ok || !beta.ok) {
-    throw new Error('expected both agents');
-  }
-  expect(alpha.value.token).not.toBe(beta.value.token);
+async function register(name: string): Promise<Response> {
+  return fetch(`${baseUrl}/dashboard/agents`, {
+    method: 'POST',
+    headers: { ...desk(), 'content-type': 'application/json' },
+    body: JSON.stringify({ name }),
+  });
+}
 
-  const duplicate = await registerAgent(config, 'Alpha');
-  expect(duplicate).toEqual({ ok: false, failure: 'conflict' });
+test('dashboard routes register, read, and rotate tokens over HTTP', async () => {
+  const alphaResponse = await register('alpha');
+  const betaResponse = await register('beta');
+  expect(alphaResponse.status).toBe(201);
+  expect(betaResponse.status).toBe(201);
+  const alpha = (await alphaResponse.json()) as {
+    id: string;
+    name: string;
+    token: string;
+  };
+  const beta = (await betaResponse.json()) as {
+    id: string;
+    name: string;
+    token: string;
+  };
+  expect(alpha.token).not.toBe(beta.token);
+
+  const duplicate = await register('Alpha');
+  expect(duplicate.status).toBe(409);
 
   const sent = await fetch(`${baseUrl}/messages`, {
     method: 'POST',
     headers: {
-      authorization: `Bearer ${alpha.value.token}`,
+      authorization: `Bearer ${alpha.token}`,
       'content-type': 'application/json',
     },
     body: JSON.stringify({ to: 'beta', body: 'from the bench' }),
   });
   expect(sent.status).toBe(201);
 
-  const ledger = await loadLedger(config, {
-    inboxId: beta.value.id,
-    historyAfter: undefined,
-    inboxAfter: undefined,
+  const agents = await fetch(`${baseUrl}/dashboard/agents`, {
+    headers: desk(),
   });
-  expect(ledger.ok).toBe(true);
-  if (!ledger.ok) {
-    throw new Error('expected a ledger');
-  }
-  expect(ledger.value.agents.map((agent) => agent.name)).toEqual([
+  const history = await fetch(`${baseUrl}/dashboard/messages`, {
+    headers: desk(),
+  });
+  const inbox = await fetch(`${baseUrl}/dashboard/agents/${beta.id}/inbox`, {
+    headers: desk(),
+  });
+  expect(agents.status).toBe(200);
+  expect(history.status).toBe(200);
+  expect(inbox.status).toBe(200);
+  const ledger = {
+    agents: (await agents.json()) as { agents: { name: string }[] },
+    history: (await history.json()) as { messages: { body: string }[] },
+    inbox: (await inbox.json()) as {
+      messages: { from: string; to: string; body: string; readAt: null }[];
+    },
+  };
+  expect(ledger.agents.agents.map((agent) => agent.name)).toEqual([
     'alpha',
     'beta',
   ]);
-  expect(ledger.value.history.messages.map((message) => message.body)).toEqual([
+  expect(ledger.history.messages.map((message) => message.body)).toEqual([
     'from the bench',
   ]);
-  expect(ledger.value.inbox?.messages).toEqual([
+  expect(ledger.inbox.messages).toEqual([
     expect.objectContaining({
       from: 'alpha',
       to: 'beta',
@@ -98,65 +102,74 @@ test('the web client registers, reads, and rotates tokens through the API', asyn
       readAt: null,
     }),
   ]);
-  expect(JSON.stringify(ledger.value)).not.toContain(alpha.value.token);
-  expect(JSON.stringify(ledger.value)).not.toContain(SECRET);
+  const serialized = JSON.stringify(ledger);
+  expect(serialized).not.toContain(alpha.token);
+  expect(serialized).not.toContain(SECRET);
 
   const receipt = await admin.query<{ read_at: Date | null }>(
     `SELECT read_at
      FROM message_receipts
      WHERE agent_id = $1`,
-    [beta.value.id],
+    [beta.id],
   );
   expect(receipt.rows[0]?.read_at).toBeNull();
 
-  const revoked = await revokeAgentToken(config, alpha.value.id);
-  expect(revoked).toEqual({
-    ok: true,
-    value: { id: alpha.value.id, name: 'alpha', tokenRevoked: true },
+  const revoked = await fetch(
+    `${baseUrl}/dashboard/agents/${alpha.id}/token/revoke`,
+    { method: 'POST', headers: desk() },
+  );
+  expect(revoked.status).toBe(200);
+  expect(await revoked.json()).toEqual({
+    id: alpha.id,
+    name: 'alpha',
+    tokenRevoked: true,
   });
   const locked = await fetch(`${baseUrl}/agents`, {
-    headers: { authorization: `Bearer ${alpha.value.token}` },
+    headers: { authorization: `Bearer ${alpha.token}` },
   });
   expect(locked.status).toBe(401);
 
-  const issued = await issueAgentToken(config, alpha.value.id);
-  expect(issued.ok).toBe(true);
-  if (!issued.ok) {
-    throw new Error('expected a replacement token');
-  }
+  const issued = await fetch(`${baseUrl}/dashboard/agents/${alpha.id}/token`, {
+    method: 'POST',
+    headers: desk(),
+  });
+  expect(issued.status).toBe(201);
+  const replacement = (await issued.json()) as { token: string };
   const unlocked = await fetch(`${baseUrl}/agents`, {
-    headers: { authorization: `Bearer ${issued.value.token}` },
+    headers: { authorization: `Bearer ${replacement.token}` },
   });
   expect(unlocked.status).toBe(200);
-  expect(issued.value.token).not.toBe(alpha.value.token);
+  expect(replacement.token).not.toBe(alpha.token);
 
-  const rejected = await loadLedger(
-    configFor(baseUrl, 'wrong-desk-key'),
-    selection,
-  );
-  expect(rejected).toEqual({ ok: false, failure: 'unauthorized' });
-  expect(JSON.stringify(rejected)).not.toContain('wrong-desk-key');
-  expect(JSON.stringify(rejected)).not.toContain(SECRET);
+  const rejected = await fetch(`${baseUrl}/dashboard/agents`, {
+    headers: desk('wrong-desk-key'),
+  });
+  expect(rejected.status).toBe(401);
+  const rejectedBody = await rejected.text();
+  expect(rejectedBody).not.toContain('wrong-desk-key');
+  expect(rejectedBody).not.toContain(SECRET);
 });
 
-test('the web client surfaces a database outage and an unreachable API', async () => {
+test('a closed database returns 503 and a closed port is unreachable', async () => {
   const down = buildApp(
     'postgres://switchboard_user:s3cret-pass@127.0.0.1:1/unreachable_test',
     { dashboardSecret: SECRET },
   );
   try {
     const address = await down.listen({ host: '127.0.0.1', port: 0 });
-    const result = await loadLedger(configFor(address), selection);
-    expect(result).toEqual({ ok: false, failure: 'database_unavailable' });
-    expect(JSON.stringify(result)).not.toContain('s3cret-pass');
-    expect(JSON.stringify(result)).not.toContain(SECRET);
+    const result = await fetch(`${address}/dashboard/agents`, {
+      headers: desk(),
+    });
+    expect(result.status).toBe(503);
+    const body = await result.text();
+    expect(body).toContain('database_unavailable');
+    expect(body).not.toContain('s3cret-pass');
+    expect(body).not.toContain(SECRET);
   } finally {
     await down.close();
   }
 
-  const unreachable = await loadLedger(
-    { url: 'http://127.0.0.1:1', secret: SECRET },
-    selection,
-  );
-  expect(unreachable).toEqual({ ok: false, failure: 'unreachable' });
+  await expect(
+    fetch('http://127.0.0.1:1/dashboard/agents', { headers: desk() }),
+  ).rejects.toThrow();
 });

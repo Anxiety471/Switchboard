@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { request as httpRequest } from 'node:http';
 import { Client } from 'pg';
 import { afterAll, beforeAll, beforeEach, expect, test } from 'vitest';
 import type {
@@ -22,7 +23,7 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
-  await admin.query('TRUNCATE agents CASCADE');
+  await admin.query('TRUNCATE agents, dashboard_sessions CASCADE');
 });
 
 afterAll(async () => {
@@ -66,6 +67,24 @@ test('dashboard routes reject a missing or wrong secret and do not echo it', asy
     {
       method: 'POST' as const,
       url: '/dashboard/agents/00000000-0000-4000-8000-000000000001/token/revoke',
+    },
+    { method: 'POST' as const, url: '/dashboard/sessions' },
+    {
+      method: 'GET' as const,
+      url: `/dashboard/sessions/${'a'.repeat(43)}`,
+    },
+    {
+      method: 'DELETE' as const,
+      url: `/dashboard/sessions/${'a'.repeat(43)}`,
+    },
+    {
+      method: 'POST' as const,
+      url: `/dashboard/sessions/${'a'.repeat(43)}/notices`,
+      payload: { type: 'revoked', name: 'alpha' },
+    },
+    {
+      method: 'POST' as const,
+      url: `/dashboard/sessions/${'a'.repeat(43)}/notices/${'b'.repeat(43)}/take`,
     },
   ];
   for (const route of routes) {
@@ -520,7 +539,160 @@ test('an agent inbox is readable without marking it read or updating last_seen',
   expect(missing.statusCode).toBe(404);
   expect(missing.json()).toEqual({ error: 'not found' });
 
+  const badCursor = await app.inject({
+    method: 'GET',
+    url: `/dashboard/agents/${beta.id}/inbox?after=nope`,
+    headers: desk(),
+  });
+  expect(badCursor.statusCode).toBe(400);
+  expect(badCursor.json()).toEqual({ error: 'invalid request' });
+
   expect(missing.body).not.toContain(alpha.token);
+});
+
+function rawGet(
+  port: number,
+  path: string,
+  headers: Record<string, string>,
+): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      { hostname: '127.0.0.1', port, path, method: 'GET', headers },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => {
+          chunks.push(chunk);
+        });
+        res.on('end', () => {
+          resolve({
+            status: res.statusCode ?? 0,
+            body: Buffer.concat(chunks).toString('utf8'),
+          });
+        });
+      },
+    );
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+test('encoded, mixed-case, and double-slash dashboard paths do not accept an agent token', async () => {
+  const alpha = await register('alpha');
+  const exposed = buildApp(databaseUrl, { dashboardSecret: SECRET });
+  await exposed.ready();
+  await exposed.migrationsReady;
+  const address = await exposed.listen({ host: '127.0.0.1', port: 0 });
+  const port = Number(new URL(address).port);
+  try {
+    const paths = [
+      '/%64ashboard/agents',
+      '/Dashboard/agents',
+      '//dashboard/agents',
+      '/dashboard/agents',
+    ];
+    for (const path of paths) {
+      const response = await rawGet(port, path, {
+        authorization: `Bearer ${alpha.token}`,
+      });
+      expect(response.status, path).not.toBe(200);
+      expect(response.body, path).not.toContain(alpha.name);
+      expect(response.body, path).not.toContain(alpha.token);
+    }
+    const opened = await rawGet(port, '/dashboard/agents', desk());
+    expect(opened.status).toBe(200);
+    expect(opened.body).toContain(alpha.name);
+    expect(opened.body).not.toContain(alpha.token);
+  } finally {
+    await exposed.close();
+  }
+});
+
+test('a new desk session replaces the previous one and a notice is taken once', async () => {
+  const first = await app.inject({
+    method: 'POST',
+    url: '/dashboard/sessions',
+    headers: desk(),
+  });
+  expect(first.statusCode).toBe(201);
+  const opened = first.json() as { id: string; csrfToken: string };
+  expect(opened.id).toMatch(/^[A-Za-z0-9_-]{32,128}$/);
+  expect(opened.csrfToken).toMatch(/^[A-Za-z0-9_-]{32,128}$/);
+  expect(opened.csrfToken).not.toBe(opened.id);
+
+  const read = await app.inject({
+    method: 'GET',
+    url: `/dashboard/sessions/${opened.id}`,
+    headers: desk(),
+  });
+  expect(read.statusCode).toBe(200);
+  expect(read.json()).toEqual({ csrfToken: opened.csrfToken });
+
+  const wrongId = await app.inject({
+    method: 'GET',
+    url: '/dashboard/sessions/not-a-valid-id',
+    headers: desk('wrong-desk-key'),
+  });
+  expect(wrongId.statusCode).toBe(401);
+
+  const second = await app.inject({
+    method: 'POST',
+    url: '/dashboard/sessions',
+    headers: desk(),
+  });
+  expect(second.statusCode).toBe(201);
+  const next = second.json() as { id: string; csrfToken: string };
+  const stale = await app.inject({
+    method: 'GET',
+    url: `/dashboard/sessions/${opened.id}`,
+    headers: desk(),
+  });
+  expect(stale.statusCode).toBe(404);
+
+  const notice = await app.inject({
+    method: 'POST',
+    url: `/dashboard/sessions/${next.id}/notices`,
+    headers: desk(),
+    payload: {
+      type: 'issued',
+      id: 'agent',
+      name: 'alpha',
+      token: 'shown-once',
+    },
+  });
+  expect(notice.statusCode).toBe(201);
+  const noticeId = (notice.json() as { id: string }).id;
+
+  const taken = await app.inject({
+    method: 'POST',
+    url: `/dashboard/sessions/${next.id}/notices/${noticeId}/take`,
+    headers: desk(),
+  });
+  expect(taken.statusCode).toBe(200);
+  expect(taken.json()).toEqual({
+    type: 'issued',
+    id: 'agent',
+    name: 'alpha',
+    token: 'shown-once',
+  });
+  const again = await app.inject({
+    method: 'POST',
+    url: `/dashboard/sessions/${next.id}/notices/${noticeId}/take`,
+    headers: desk(),
+  });
+  expect(again.statusCode).toBe(404);
+
+  const removed = await app.inject({
+    method: 'DELETE',
+    url: `/dashboard/sessions/${next.id}`,
+    headers: desk(),
+  });
+  expect(removed.statusCode).toBe(204);
+  const gone = await app.inject({
+    method: 'GET',
+    url: `/dashboard/sessions/${next.id}`,
+    headers: desk(),
+  });
+  expect(gone.statusCode).toBe(404);
 });
 
 test('logs redact the dashboard secret and issued tokens', async () => {

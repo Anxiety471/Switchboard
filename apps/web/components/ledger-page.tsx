@@ -15,6 +15,7 @@ export type LedgerPageProps = {
   theme: 'light' | 'dark' | 'system';
   query: LedgerQuery;
   flash: Flash | undefined;
+  csrf: string;
   model: LedgerModel;
 };
 
@@ -30,6 +31,7 @@ function Shell(props: {
   theme: LedgerPageProps['theme'];
   returnTo: string;
   signedIn: boolean;
+  csrf: string;
   children: ReactNode;
 }) {
   return (
@@ -50,6 +52,7 @@ function Shell(props: {
             <form method="post" action="/desk" className="theme-switch">
               <input type="hidden" name="intent" value="theme" />
               <input type="hidden" name="returnTo" value={props.returnTo} />
+              <input type="hidden" name="csrf" value={props.csrf} />
               <button
                 type="submit"
                 name="theme"
@@ -70,6 +73,7 @@ function Shell(props: {
             {props.signedIn ? (
               <form method="post" action="/desk">
                 <input type="hidden" name="intent" value="logout" />
+                <input type="hidden" name="csrf" value={props.csrf} />
                 <button type="submit" className="secondary">
                   Close desk
                 </button>
@@ -123,8 +127,9 @@ function Desk(props: {
   snapshot: LedgerSnapshot;
   query: LedgerQuery;
   returnTo: string;
+  csrf: string;
 }) {
-  const { snapshot, query, returnTo } = props;
+  const { snapshot, query, returnTo, csrf } = props;
   const selected = snapshot.agents.find((agent) => agent.id === query.inbox);
   return (
     <>
@@ -133,6 +138,7 @@ function Desk(props: {
         <form method="post" action="/desk" className="register-form">
           <input type="hidden" name="intent" value="register" />
           <input type="hidden" name="returnTo" value={returnTo} />
+          <input type="hidden" name="csrf" value={csrf} />
           <label htmlFor="agent-name">Agent name</label>
           <input
             id="agent-name"
@@ -175,6 +181,7 @@ function Desk(props: {
                     current={agent.id === query.inbox}
                     query={query}
                     returnTo={returnTo}
+                    csrf={csrf}
                   />
                 ))}
               </tbody>
@@ -275,8 +282,9 @@ function AgentRow(props: {
   current: boolean;
   query: LedgerQuery;
   returnTo: string;
+  csrf: string;
 }) {
-  const { agent, query, returnTo } = props;
+  const { agent, query, returnTo, csrf } = props;
   return (
     <tr data-current={props.current ? 'true' : undefined}>
       <th scope="row">
@@ -308,6 +316,7 @@ function AgentRow(props: {
             <input type="hidden" name="intent" value="issue" />
             <input type="hidden" name="id" value={agent.id} />
             <input type="hidden" name="returnTo" value={returnTo} />
+            <input type="hidden" name="csrf" value={csrf} />
             <button type="submit">Issue new token</button>
           </form>
           {agent.tokenRevoked ? null : (
@@ -317,6 +326,7 @@ function AgentRow(props: {
                 <input type="hidden" name="intent" value="revoke" />
                 <input type="hidden" name="id" value={agent.id} />
                 <input type="hidden" name="returnTo" value={returnTo} />
+                <input type="hidden" name="csrf" value={csrf} />
                 <p>This signs {agent.name} out until you issue a new token.</p>
                 <button type="submit">Revoke token for {agent.name}</button>
               </form>
@@ -405,6 +415,7 @@ export function LedgerPage(props: LedgerPageProps) {
       theme={props.theme}
       returnTo={returnTo}
       signedIn={props.model.kind === 'desk'}
+      csrf={props.csrf}
     >
       <Notices flash={props.flash} where={where} />
       {props.model.kind === 'unconfigured' ? (
@@ -419,6 +430,7 @@ export function LedgerPage(props: LedgerPageProps) {
           </p>
           <form method="post" action="/desk" className="login-form">
             <input type="hidden" name="intent" value="login" />
+            <input type="hidden" name="csrf" value={props.csrf} />
             <label className="visually-hidden" htmlFor="desk-user">
               Desk
             </label>
@@ -452,6 +464,7 @@ export function LedgerPage(props: LedgerPageProps) {
           snapshot={props.model.result.value}
           query={props.query}
           returnTo={returnTo}
+          csrf={props.csrf}
         />
       ) : null}
     </Shell>

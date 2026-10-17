@@ -1,7 +1,9 @@
 import { expect, test } from 'vitest';
 import { runtimeSecrets } from './options.js';
 
-test('runtime secrets omit blank values', () => {
+const DESK_SECRET = 'desk-secret-desk-secret-desk-secret';
+
+test('runtime secrets omit blank values and reject a short dashboard secret', () => {
   expect(runtimeSecrets({})).toEqual({});
   expect(
     runtimeSecrets({
@@ -12,10 +14,15 @@ test('runtime secrets omit blank values', () => {
   expect(
     runtimeSecrets({
       REGISTRATION_SECRET: 'reg',
-      DASHBOARD_SECRET: 'desk',
+      DASHBOARD_SECRET: DESK_SECRET,
     }),
   ).toEqual({
     registrationSecret: 'reg',
-    dashboardSecret: 'desk',
+    dashboardSecret: DESK_SECRET,
   });
+  expect(() =>
+    runtimeSecrets({
+      DASHBOARD_SECRET: 'too-short',
+    }),
+  ).toThrow(/DASHBOARD_SECRET must be at least 32 characters/);
 });

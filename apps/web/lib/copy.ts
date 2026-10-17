@@ -15,6 +15,7 @@ const DESK_COPY: Record<DeskFailure, string> = {
   not_found: 'That agent is no longer on the ledger.',
   failed:
     'The API returned an unexpected response. The ledger was left unchanged.',
+  unknown: 'The API returned an unexpected response. The result is unknown.',
 };
 
 export function failureCopy(
