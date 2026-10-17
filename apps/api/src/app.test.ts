@@ -1,12 +1,10 @@
 import { Client } from 'pg';
 import { afterAll, expect, test } from 'vitest';
-import { buildApp, parsePort } from './app.js';
+import { buildApp, parseHost, parsePort } from './app.js';
 import { startHoldingProxy } from './test-helpers/holding-proxy.js';
+import { assertTestDatabaseUrl } from './test-helpers/test-database.js';
 
-const databaseUrl = process.env.DATABASE_URL;
-if (!databaseUrl) {
-  throw new Error('DATABASE_URL is required');
-}
+const databaseUrl = assertTestDatabaseUrl(process.env.TEST_DATABASE_URL);
 
 const app = buildApp(databaseUrl);
 
@@ -25,7 +23,14 @@ test('parsePort accepts integers from 1 to 65535', () => {
   expect(() => parsePort('nope')).toThrow(/1 to 65535/);
 });
 
+test('parseHost defaults to loopback', () => {
+  expect(parseHost(undefined)).toBe('127.0.0.1');
+  expect(parseHost('')).toBe('127.0.0.1');
+  expect(parseHost('0.0.0.0')).toBe('0.0.0.0');
+});
+
 test('GET /health queries postgres', async () => {
+  await app.migrationsReady;
   const address = await app.listen({ host: '127.0.0.1', port: 0 });
   const response = await fetch(`${address}/health`);
   expect(response.status).toBe(200);
@@ -34,8 +39,7 @@ test('GET /health queries postgres', async () => {
 
 test('GET /health returns 503 when postgres is unreachable', async () => {
   const down = buildApp(
-    'postgres://switchboard_user:s3cret-pass@127.0.0.1:1/switchboard_db',
-    { migrate: false },
+    'postgres://switchboard_user:s3cret-pass@127.0.0.1:1/unreachable_test',
   );
 
   try {
@@ -44,10 +48,11 @@ test('GET /health returns 503 when postgres is unreachable', async () => {
     const body = await response.text();
 
     expect(response.status).toBe(503);
-    expect(JSON.parse(body)).toEqual({ ok: false });
+    expect(body).toBe('{"ok":false}');
     expect(body).not.toMatch(
-      /ECONNREFUSED|switchboard_user|s3cret-pass|switchboard_db|127\.0\.0\.1/,
+      /ECONNREFUSED|switchboard_user|s3cret-pass|unreachable_test|127\.0\.0\.1/,
     );
+    expect(down.server.listening).toBe(true);
   } finally {
     await down.close();
   }
@@ -71,6 +76,7 @@ test('GET /health survives pg_terminate_backend', async () => {
   try {
     await admin.connect();
     const address = await terminated.listen({ host: '127.0.0.1', port: 0 });
+    await terminated.migrationsReady;
     const warm = await fetch(`${address}/health`);
     expect(warm.status).toBe(200);
     expect(proxy.connectionCount()).toBe(1);

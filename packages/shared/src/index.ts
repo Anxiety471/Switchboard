@@ -26,6 +26,11 @@ export type InboxMessage = {
   readAt: string | null;
 };
 
+export type InboxPage = {
+  messages: InboxMessage[];
+  next: string | null;
+};
+
 export type ReadReceipt = {
   read: string[];
 };

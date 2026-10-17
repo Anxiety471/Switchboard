@@ -2,18 +2,16 @@ import { createHash } from 'node:crypto';
 import { Client } from 'pg';
 import { afterAll, beforeAll, beforeEach, expect, test } from 'vitest';
 import { buildApp } from './app.js';
+import { assertTestDatabaseUrl } from './test-helpers/test-database.js';
 import type {
   AgentSummary,
-  InboxMessage,
+  InboxPage,
   ReadReceipt,
   RegisteredAgent,
   SentMessage,
 } from '@switchboard/shared';
 
-const databaseUrl = process.env.DATABASE_URL;
-if (!databaseUrl) {
-  throw new Error('DATABASE_URL is required');
-}
+const databaseUrl = assertTestDatabaseUrl(process.env.TEST_DATABASE_URL);
 
 const app = buildApp(databaseUrl);
 const admin = new Client({ connectionString: databaseUrl });
@@ -21,6 +19,7 @@ const admin = new Client({ connectionString: databaseUrl });
 beforeAll(async () => {
   await admin.connect();
   await app.ready();
+  await app.migrationsReady;
 });
 
 beforeEach(async () => {
@@ -63,12 +62,22 @@ async function send(
 async function inbox(
   token: string,
   unread?: boolean,
-): Promise<{ messages: InboxMessage[] }> {
-  const url =
-    unread === undefined ? '/inbox' : `/inbox?unread=${String(unread)}`;
+  page?: { limit?: number; after?: string },
+): Promise<InboxPage> {
+  const params = new URLSearchParams();
+  if (unread !== undefined) {
+    params.set('unread', String(unread));
+  }
+  if (page?.limit !== undefined) {
+    params.set('limit', String(page.limit));
+  }
+  if (page?.after !== undefined) {
+    params.set('after', page.after);
+  }
+  const query = params.toString();
   const response = await app.inject({
     method: 'GET',
-    url,
+    url: query === '' ? '/inbox' : `/inbox?${query}`,
     headers: bearer(token),
   });
   expect(response.statusCode).toBe(200);
@@ -120,9 +129,16 @@ test('migration creates agents, messages, and per-recipient receipts', async () 
     { table_name: 'messages', column_name: 'created_at' },
     { table_name: 'messages', column_name: 'from_agent' },
     { table_name: 'messages', column_name: 'id' },
-    { table_name: 'messages', column_name: 'read_at' },
     { table_name: 'messages', column_name: 'to_agent' },
   ]);
+
+  const index = await admin.query(
+    `SELECT 1
+     FROM pg_indexes
+     WHERE schemaname = 'public'
+       AND indexname = 'agents_name_lower_idx'`,
+  );
+  expect(index.rowCount).toBe(1);
 });
 
 test('POST /agents returns a token once and stores only its hash', async () => {
@@ -185,6 +201,14 @@ test('duplicate agent names return 409 and do not issue a token', async () => {
   expect(count.rows[0]?.count).toBe(1);
   const loser = left.statusCode === 409 ? left : right;
   expect(loser.body).not.toContain('token');
+
+  const casing = await app.inject({
+    method: 'POST',
+    url: '/agents',
+    payload: { name: 'Alpha' },
+  });
+  expect(casing.statusCode).toBe(409);
+  expect(casing.json()).toEqual({ error: 'name already registered' });
 });
 
 test('POST /agents rejects invalid names', async () => {
@@ -352,6 +376,57 @@ test('GET /agents reports online status from the last 60 seconds', async () => {
   );
 });
 
+test('last_seen_at updates only when it is older than 10 seconds', async () => {
+  const alpha = await register('alpha');
+  const first = await app.inject({
+    method: 'GET',
+    url: '/agents',
+    headers: bearer(alpha.token),
+  });
+  expect(first.statusCode).toBe(200);
+  await admin.query(
+    `UPDATE agents
+     SET last_seen_at = clock_timestamp() - interval '1 second'
+     WHERE name = 'alpha'`,
+  );
+  const stamped = await admin.query<{ last_seen_at: Date }>(
+    'SELECT last_seen_at FROM agents WHERE name = $1',
+    ['alpha'],
+  );
+  const recent = await app.inject({
+    method: 'GET',
+    url: '/inbox',
+    headers: bearer(alpha.token),
+  });
+  expect(recent.statusCode).toBe(200);
+  const unchanged = await admin.query<{ last_seen_at: Date }>(
+    'SELECT last_seen_at FROM agents WHERE name = $1',
+    ['alpha'],
+  );
+  expect(unchanged.rows[0]?.last_seen_at.toISOString()).toBe(
+    stamped.rows[0]?.last_seen_at.toISOString(),
+  );
+
+  await admin.query(
+    `UPDATE agents
+     SET last_seen_at = clock_timestamp() - interval '11 seconds'
+     WHERE name = 'alpha'`,
+  );
+  const aged = await app.inject({
+    method: 'GET',
+    url: '/agents',
+    headers: bearer(alpha.token),
+  });
+  expect(aged.statusCode).toBe(200);
+  const touched = await admin.query<{ last_seen_at: Date }>(
+    'SELECT last_seen_at FROM agents WHERE name = $1',
+    ['alpha'],
+  );
+  expect(touched.rows[0]?.last_seen_at.getTime()).toBeGreaterThan(
+    Date.now() - 5000,
+  );
+});
+
 test('POST /messages validates the body and recipient', async () => {
   const alpha = await register('alpha');
   const beta = await register('beta');
@@ -450,7 +525,7 @@ test('direct messages are oldest-first and visible only to the recipient', async
     to: 'alpha',
     readAt: null,
   });
-  expect(await inbox(beta.token)).toEqual({ messages: [] });
+  expect(await inbox(beta.token)).toEqual({ messages: [], next: null });
   expect((await inbox(gamma.token)).messages).toEqual([]);
 
   await markRead(alpha.token, [older.id]);
@@ -459,13 +534,17 @@ test('direct messages are oldest-first and visible only to the recipient', async
   ).toEqual([newer.id]);
   expect((await inbox(alpha.token, false)).messages).toHaveLength(2);
   const direct = await admin.query<{ read_at: Date | null }>(
-    'SELECT read_at FROM messages WHERE id = $1',
-    [older.id],
+    `SELECT read_at
+     FROM message_receipts
+     WHERE message_id = $1 AND agent_id = $2`,
+    [older.id, alpha.id],
   );
   expect(direct.rows[0]?.read_at).not.toBeNull();
   const untouched = await admin.query<{ read_at: Date | null }>(
-    'SELECT read_at FROM messages WHERE id = $1',
-    [newer.id],
+    `SELECT read_at
+     FROM message_receipts
+     WHERE message_id = $1 AND agent_id = $2`,
+    [newer.id, alpha.id],
   );
   expect(untouched.rows[0]?.read_at).toBeNull();
 });
@@ -499,11 +578,6 @@ test('agent B cannot read or mark agent A messages', async () => {
     [secret.id, alpha.id],
   );
   expect(receipt.rows[0]?.read_at).toBeNull();
-  const message = await admin.query<{ read_at: Date | null }>(
-    'SELECT read_at FROM messages WHERE id = $1',
-    [secret.id],
-  );
-  expect(message.rows[0]?.read_at).toBeNull();
 
   const mixed = await app.inject({
     method: 'POST',
@@ -531,7 +605,10 @@ test('broadcast fan-out keeps read state per recipient', async () => {
   const gamma = await register('gamma');
   const sent = await send(alpha.token, { to: '*', body: 'hello all' });
 
-  expect(await inbox(alpha.token, true)).toEqual({ messages: [] });
+  expect(await inbox(alpha.token, true)).toEqual({
+    messages: [],
+    next: null,
+  });
   const betaUnread = await inbox(beta.token, true);
   const gammaUnread = await inbox(gamma.token, true);
   expect(betaUnread.messages.map((message) => message.id)).toEqual([sent.id]);
@@ -544,7 +621,10 @@ test('broadcast fan-out keeps read state per recipient', async () => {
   });
 
   expect(await markRead(beta.token, [sent.id])).toEqual({ read: [sent.id] });
-  expect(await inbox(beta.token, true)).toEqual({ messages: [] });
+  expect(await inbox(beta.token, true)).toEqual({
+    messages: [],
+    next: null,
+  });
   expect(
     (await inbox(gamma.token, true)).messages.map((message) => message.id),
   ).toEqual([sent.id]);
@@ -562,24 +642,36 @@ test('broadcast fan-out keeps read state per recipient', async () => {
     { name: 'beta', read: true },
     { name: 'gamma', read: false },
   ]);
-  const stored = await admin.query<{
-    to_agent: string | null;
-    read_at: Date | null;
-  }>('SELECT to_agent, read_at FROM messages WHERE id = $1', [sent.id]);
-  expect(stored.rows[0]).toEqual({ to_agent: null, read_at: null });
+  const stored = await admin.query<{ to_agent: string | null }>(
+    'SELECT to_agent FROM messages WHERE id = $1',
+    [sent.id],
+  );
+  expect(stored.rows[0]).toEqual({ to_agent: null });
 
   const delta = await register('delta');
-  expect(await inbox(delta.token, true)).toEqual({ messages: [] });
+  expect(await inbox(delta.token, true)).toEqual({ messages: [], next: null });
+});
 
-  const alone = await register('solo');
-  const empty = await send(alone.token, { to: '*', body: 'nobody else' });
-  expect(empty.id).toMatch(/-/);
-  expect(await inbox(alone.token)).toEqual({ messages: [] });
+test('broadcast with no other agents stores the message and no receipts', async () => {
+  const solo = await register('solo');
+  const sent = await send(solo.token, { to: '*', body: 'nobody else' });
+  expect(await inbox(solo.token)).toEqual({ messages: [], next: null });
+  const receipts = await admin.query<{ count: number }>(
+    'SELECT count(*)::int AS count FROM message_receipts WHERE message_id = $1',
+    [sent.id],
+  );
+  expect(receipts.rows[0]?.count).toBe(0);
+  const stored = await admin.query<{ to_agent: string | null }>(
+    'SELECT to_agent FROM messages WHERE id = $1',
+    [sent.id],
+  );
+  expect(stored.rows[0]?.to_agent).toBeNull();
 });
 
 test('logs redact authorization and never include tokens', async () => {
   const lines: string[] = [];
   const logged = buildApp(databaseUrl, {
+    registrationSecret: 'log-secret',
     logStream: {
       write(message: string) {
         lines.push(message);
@@ -587,9 +679,11 @@ test('logs redact authorization and never include tokens', async () => {
     },
   });
   try {
+    await logged.migrationsReady;
     const created = await logged.inject({
       method: 'POST',
       url: '/agents',
+      headers: { 'x-registration-secret': 'log-secret' },
       payload: { name: 'logger' },
     });
     const token = (created.json() as RegisteredAgent).token;
@@ -609,6 +703,7 @@ test('logs redact authorization and never include tokens', async () => {
     expect(output).toContain('[Redacted]');
     expect(output).not.toContain(token);
     expect(output).not.toContain('wrong-token-value');
+    expect(output).not.toContain('log-secret');
   } finally {
     await logged.close();
   }
@@ -648,4 +743,118 @@ test('request bodies have length limits', async () => {
     headers: bearer(alpha.token),
   });
   expect(badUnread.statusCode).toBe(400);
+});
+
+test('GET /inbox pages with limit and after', async () => {
+  const alpha = await register('alpha');
+  const beta = await register('beta');
+  await admin.query(
+    `INSERT INTO messages (from_agent, to_agent, body, created_at)
+     SELECT $1::uuid,
+            $2::uuid,
+            'm' || g::text,
+            timestamp '2024-01-01' + (g::text || ' milliseconds')::interval
+     FROM generate_series(1, 51) AS g`,
+    [beta.id, alpha.id],
+  );
+  await admin.query(
+    `INSERT INTO message_receipts (message_id, agent_id)
+     SELECT id, $1::uuid FROM messages`,
+    [alpha.id],
+  );
+
+  const first = await inbox(alpha.token);
+  expect(first.messages).toHaveLength(50);
+  expect(first.messages[0]?.body).toBe('m1');
+  expect(first.messages[49]?.body).toBe('m50');
+  const cursor = first.next;
+  expect(cursor).toBe(
+    `${first.messages[49]?.createdAt}|${first.messages[49]?.id}`,
+  );
+  if (cursor === null) {
+    throw new Error('expected a cursor');
+  }
+  const second = await inbox(alpha.token, undefined, { after: cursor });
+  expect(second.messages.map((message) => message.body)).toEqual(['m51']);
+  expect(second.next).toBeNull();
+
+  const paged = await inbox(alpha.token, false, { limit: 2 });
+  expect(paged.messages.map((message) => message.body)).toEqual(['m1', 'm2']);
+  const pageCursor = paged.next;
+  if (pageCursor === null) {
+    throw new Error('expected a cursor');
+  }
+  const rest = await inbox(alpha.token, false, {
+    limit: 2,
+    after: pageCursor,
+  });
+  expect(rest.messages.map((message) => message.body)).toEqual(['m3', 'm4']);
+
+  const wide = await inbox(alpha.token, false, { limit: 200 });
+  expect(wide.messages).toHaveLength(51);
+  expect(wide.next).toBeNull();
+
+  const zero = await app.inject({
+    method: 'GET',
+    url: '/inbox?limit=0',
+    headers: bearer(alpha.token),
+  });
+  expect(zero.statusCode).toBe(400);
+  const tooHigh = await app.inject({
+    method: 'GET',
+    url: '/inbox?limit=201',
+    headers: bearer(alpha.token),
+  });
+  expect(tooHigh.statusCode).toBe(400);
+  const badCursor = await app.inject({
+    method: 'GET',
+    url: '/inbox?after=nope',
+    headers: bearer(alpha.token),
+  });
+  expect(badCursor.statusCode).toBe(400);
+});
+
+test('POST /agents requires the registration secret when it is set', async () => {
+  const guarded = buildApp(databaseUrl, { registrationSecret: 'top-secret' });
+  try {
+    await guarded.migrationsReady;
+    const missing = await guarded.inject({
+      method: 'POST',
+      url: '/agents',
+      payload: { name: 'alpha' },
+    });
+    expect(missing.statusCode).toBe(401);
+    expect(missing.json()).toEqual({ error: 'unauthorized' });
+    expect(missing.body).not.toContain('top-secret');
+
+    const wrong = await guarded.inject({
+      method: 'POST',
+      url: '/agents',
+      headers: { 'x-registration-secret': 'nope' },
+      payload: { name: 'alpha' },
+    });
+    expect(wrong.statusCode).toBe(401);
+    expect(wrong.json()).toEqual({ error: 'unauthorized' });
+    expect(wrong.body).not.toContain('top-secret');
+    expect(wrong.body).not.toContain('nope');
+
+    const created = await guarded.inject({
+      method: 'POST',
+      url: '/agents',
+      headers: { 'x-registration-secret': 'top-secret' },
+      payload: { name: 'alpha' },
+    });
+    expect(created.statusCode).toBe(201);
+    const token = (created.json() as RegisteredAgent).token;
+    const listed = await guarded.inject({
+      method: 'GET',
+      url: '/agents',
+      headers: bearer(token),
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.body).not.toContain('top-secret');
+    expect(listed.body).not.toContain(token);
+  } finally {
+    await guarded.close();
+  }
 });
