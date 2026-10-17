@@ -16,7 +16,10 @@ type Reply = { status: number; json: unknown };
 
 const TOKEN = 'agent-token-value';
 const CURSOR = '2024-01-01T00:00:00.000Z|00000000-0000-4000-8000-000000000001';
-const READ_AT = '2024-01-01T00:00:00.000Z';
+const READ_AT = '2024-06-15T12:34:56.789Z';
+const OTHER_READ_AT = '2024-06-15T12:34:57.001Z';
+const MARK_READ_WARNING =
+  'Mark-read could not be confirmed. These messages may show again.';
 
 function message(id: string) {
   return {
@@ -39,7 +42,7 @@ async function startMock(
     const reply = respond(recorded);
     res.writeHead(reply.status, {
       'content-type': 'application/json',
-      date: 'Mon, 01 Jan 2024 00:00:00 GMT',
+      date: 'Wed, 01 Jan 2020 00:00:00 GMT',
     });
     res.end(JSON.stringify(reply.json));
   });
@@ -92,8 +95,19 @@ function record(req: IncomingMessage): Promise<Recorded> {
   });
 }
 
-async function connect(url: string, token = TOKEN) {
-  const server = createMcpServer({ url, token });
+function readReceipt(ids: string[], readAt = READ_AT) {
+  return {
+    read: ids,
+    marked: ids.map((id) => ({ id, readAt })),
+  };
+}
+
+async function connect(url: string, token = TOKEN, fetchImpl?: typeof fetch) {
+  const server = createMcpServer({
+    url,
+    token,
+    ...(fetchImpl !== undefined ? { fetch: fetchImpl } : {}),
+  });
   const client = new Client({ name: 'test', version: '0.0.0' });
   const [clientTransport, serverTransport] =
     InMemoryTransport.createLinkedPair();
@@ -389,7 +403,7 @@ test('check_inbox pages with one mark-read call and a fresh readAt', async () =>
       };
     }
     const batch = isIdBatch(request.body) ? request.body.ids : [];
-    return { status: 200, json: { read: batch } };
+    return { status: 200, json: readReceipt(batch) };
   });
   const session = await connect(mock.url);
   try {
@@ -500,7 +514,7 @@ test('a failed mark-read marks nothing and the message is still there', async ()
         return { status: 503, json: { error: 'database_unavailable' } };
       }
       const ids = isIdBatch(request.body) ? request.body.ids : [];
-      return { status: 200, json: { read: ids } };
+      return { status: 200, json: readReceipt(ids) };
     }
     return {
       status: 200,
@@ -566,6 +580,355 @@ test('an inbox page over 100 messages is not partially marked', async () => {
     await mock.close();
   }
 });
+
+test('check_inbox uses each returned readAt and ignores the Date header', async () => {
+  const first = '00000000-0000-4000-8000-000000000001';
+  const second = '00000000-0000-4000-8000-000000000002';
+  const mock = await startMock((request) => {
+    if (request.pathname === '/inbox/read') {
+      return {
+        status: 200,
+        json: {
+          read: [first, second],
+          marked: [
+            { id: first, readAt: READ_AT },
+            { id: second, readAt: OTHER_READ_AT },
+          ],
+        },
+      };
+    }
+    return {
+      status: 200,
+      json: { messages: [message(first), message(second)], next: null },
+    };
+  });
+  const session = await connect(mock.url);
+  try {
+    const page = await callTool(session.client, 'check_inbox');
+    expect(page.isError).toBe(false);
+    expect(page.text).toContain('hello');
+    expect(page.value).toEqual({
+      messages: [
+        { ...message(first), readAt: READ_AT },
+        { ...message(second), readAt: OTHER_READ_AT },
+      ],
+      next: null,
+      read: [first, second],
+    });
+    expect(page.text).not.toContain('2020-01-01T00:00:00.000Z');
+  } finally {
+    await session.close();
+    await mock.close();
+  }
+});
+
+test('check_inbox returns the page when mark-read stays unconfirmed', async () => {
+  const id = '00000000-0000-4000-8000-000000000001';
+  const body = `visible-after-failure ${'n'.repeat(180)} end`;
+  const failures = [502, 504, 502];
+  for (const status of failures) {
+    let reads = 0;
+    const mock = await startMock((request) => {
+      if (request.pathname === '/inbox/read') {
+        reads += 1;
+        return { status, json: { error: 'bad gateway' } };
+      }
+      return {
+        status: 200,
+        json: { messages: [{ ...message(id), body }], next: CURSOR },
+      };
+    });
+    const session = await connect(mock.url);
+    try {
+      const result = await callTool(session.client, 'check_inbox');
+      expect(result.isError, String(status)).toBe(false);
+      expect(result.text, String(status)).toContain(body);
+      expect(result.text, String(status)).toContain(MARK_READ_WARNING);
+      expect(result.text, String(status)).not.toContain(TOKEN);
+      expect(result.value, String(status)).toEqual({
+        messages: [{ ...message(id), body, readAt: null }],
+        next: CURSOR,
+        read: [],
+        warning: MARK_READ_WARNING,
+      });
+      expect(reads, String(status)).toBe(2);
+    } finally {
+      await session.close();
+      await mock.close();
+    }
+  }
+});
+
+test('check_inbox keeps the page when a later mark-read error follows a lost response', async () => {
+  const id = '00000000-0000-4000-8000-000000000001';
+  const body = `kept-after-502 ${'q'.repeat(80)} end`;
+  let reads = 0;
+  const mock = await startMock((request) => {
+    if (request.pathname === '/inbox/read') {
+      reads += 1;
+      if (reads === 1) {
+        return { status: 502, json: { error: 'bad gateway' } };
+      }
+      return { status: 503, json: { error: 'database_unavailable' } };
+    }
+    return {
+      status: 200,
+      json: { messages: [{ ...message(id), body }], next: null },
+    };
+  });
+  const session = await connect(mock.url);
+  try {
+    const result = await callTool(session.client, 'check_inbox');
+    expect(result.isError).toBe(false);
+    expect(result.text).toContain(body);
+    expect(result.value).toMatchObject({
+      messages: [{ id, body }],
+      read: [],
+      warning: MARK_READ_WARNING,
+    });
+    expect(reads).toBe(2);
+  } finally {
+    await session.close();
+    await mock.close();
+  }
+});
+
+test('check_inbox uses the retried mark-read receipt', async () => {
+  const id = '00000000-0000-4000-8000-000000000001';
+  const body = 'retried mark-read still returns the full body';
+  let reads = 0;
+  const mock = await startMock((request) => {
+    if (request.pathname === '/inbox/read') {
+      reads += 1;
+      if (reads === 1) {
+        return { status: 502, json: { error: 'bad gateway' } };
+      }
+      return { status: 200, json: readReceipt([id], OTHER_READ_AT) };
+    }
+    return {
+      status: 200,
+      json: { messages: [{ ...message(id), body }], next: null },
+    };
+  });
+  const session = await connect(mock.url);
+  try {
+    const result = await callTool(session.client, 'check_inbox');
+    expect(result.isError).toBe(false);
+    expect(result.text).toContain(body);
+    expect(result.text).not.toContain(MARK_READ_WARNING);
+    expect(result.value).toEqual({
+      messages: [{ ...message(id), body, readAt: OTHER_READ_AT }],
+      next: null,
+      read: [id],
+    });
+    expect(reads).toBe(2);
+  } finally {
+    await session.close();
+    await mock.close();
+  }
+});
+
+test('a dropped or timed-out mark-read still returns the full message', async () => {
+  const id = '00000000-0000-4000-8000-000000000001';
+  const body = `reset-or-timeout ${'z'.repeat(160)} end`;
+  const dropped = await startResetProxy(body, id);
+  const session = await connect(dropped.url);
+  try {
+    const result = await callTool(session.client, 'check_inbox');
+    expect(result.isError).toBe(false);
+    expect(result.text).toContain(body);
+    expect(result.text).toContain(MARK_READ_WARNING);
+    expect(result.value).toEqual({
+      messages: [{ ...message(id), body, readAt: null }],
+      next: null,
+      read: [],
+      warning: MARK_READ_WARNING,
+    });
+    expect(dropped.markReads).toBe(2);
+  } finally {
+    await session.close();
+    await dropped.close();
+  }
+
+  let reads = 0;
+  const fetchImpl: typeof fetch = (input) => {
+    const url = requestUrl(input);
+    if (url.pathname === '/inbox/read') {
+      reads += 1;
+      throw new DOMException(
+        'The operation was aborted due to timeout',
+        'TimeoutError',
+      );
+    }
+    return Promise.resolve(
+      new Response(
+        JSON.stringify({
+          messages: [{ ...message(id), body }],
+          next: null,
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+            date: 'Wed, 01 Jan 2020 00:00:00 GMT',
+          },
+        },
+      ),
+    );
+  };
+  const timedOut = await connect('http://127.0.0.1:9', TOKEN, fetchImpl);
+  try {
+    const result = await callTool(timedOut.client, 'check_inbox');
+    expect(result.isError).toBe(false);
+    expect(result.text).toContain(body);
+    expect(result.text).not.toContain('2020-01-01T00:00:00.000Z');
+    expect(result.text).not.toContain(TOKEN);
+    expect(result.value).toEqual({
+      messages: [{ ...message(id), body, readAt: null }],
+      next: null,
+      read: [],
+      warning: MARK_READ_WARNING,
+    });
+    expect(reads).toBe(2);
+  } finally {
+    await timedOut.close();
+  }
+});
+
+test('a mark-read body that cannot be read still returns the full message', async () => {
+  const id = '00000000-0000-4000-8000-000000000001';
+  const body = `unreadable receipt ${'b'.repeat(140)} end`;
+  let reads = 0;
+  const fetchImpl: typeof fetch = (input) => {
+    const url = requestUrl(input);
+    if (url.pathname === '/inbox/read') {
+      reads += 1;
+      if (reads === 1) {
+        return Promise.resolve(
+          new Response(
+            new ReadableStream({
+              start(controller) {
+                controller.error(new Error('socket hang up'));
+              },
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      return Promise.resolve(new Response('not-json', { status: 200 }));
+    }
+    return Promise.resolve(
+      new Response(
+        JSON.stringify({
+          messages: [{ ...message(id), body }],
+          next: null,
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ),
+    );
+  };
+  const session = await connect('http://127.0.0.1:9', TOKEN, fetchImpl);
+  try {
+    const result = await callTool(session.client, 'check_inbox');
+    expect(result.isError).toBe(false);
+    expect(result.text).toContain(body);
+    expect(result.text).toContain(MARK_READ_WARNING);
+    expect(result.text).not.toContain(TOKEN);
+    expect(result.value).toEqual({
+      messages: [{ ...message(id), body, readAt: null }],
+      next: null,
+      read: [],
+      warning: MARK_READ_WARNING,
+    });
+    expect(reads).toBe(2);
+  } finally {
+    await session.close();
+  }
+});
+
+test('an inbox fetch failure is still an error without a page', async () => {
+  const mock = await startMock(() => ({
+    status: 502,
+    json: { error: 'bad gateway' },
+  }));
+  const session = await connect(mock.url);
+  try {
+    const result = await callTool(session.client, 'check_inbox');
+    expect(result.isError).toBe(true);
+    expect(apiError(result.text)).toEqual({
+      error: 'request_failed',
+      status: 502,
+    });
+    expect(result.text).not.toContain('hello');
+    expect(mock.requests).toHaveLength(1);
+  } finally {
+    await session.close();
+    await mock.close();
+  }
+});
+
+function requestUrl(input: Parameters<typeof fetch>[0]): URL {
+  if (input instanceof URL) {
+    return input;
+  }
+  if (typeof input === 'string') {
+    return new URL(input);
+  }
+  return new URL(input.url);
+}
+
+function startResetProxy(
+  body: string,
+  id: string,
+): Promise<{ url: string; markReads: number; close: () => Promise<void> }> {
+  let markReads = 0;
+  const server = createServer((req, res) => {
+    const pathname = (req.url ?? '/').split('?')[0];
+    if (pathname === '/inbox/read') {
+      markReads += 1;
+      req.socket.destroy();
+      return;
+    }
+    req.resume();
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      date: 'Wed, 01 Jan 2020 00:00:00 GMT',
+    });
+    res.end(
+      JSON.stringify({
+        messages: [{ ...message(id), body }],
+        next: null,
+      }),
+    );
+  });
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      if (address === null || typeof address === 'string') {
+        reject(new Error('expected a TCP port'));
+        return;
+      }
+      const handle = {
+        url: `http://127.0.0.1:${address.port}`,
+        get markReads() {
+          return markReads;
+        },
+        close: () =>
+          new Promise<void>((resolveClose, rejectClose) => {
+            server.close((error) => {
+              if (error) {
+                rejectClose(error);
+                return;
+              }
+              resolveClose();
+            });
+          }),
+      };
+      resolve(handle);
+    });
+  });
+}
 
 function isIdBatch(value: unknown): value is { ids: string[] } {
   return (

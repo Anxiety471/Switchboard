@@ -198,6 +198,14 @@ function isoTime(value: Date | string | null): string | null {
   return new Date(value).toISOString();
 }
 
+function requiredIsoTime(value: Date | string | null): string {
+  const iso = isoTime(value);
+  if (iso === null) {
+    throw new Error('expected a timestamp');
+  }
+  return iso;
+}
+
 function caller(request: {
   agent: AuthenticatedAgent | null;
 }): AuthenticatedAgent {
@@ -827,11 +835,23 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
           200: {
             type: 'object',
             additionalProperties: false,
-            required: ['read'],
+            required: ['read', 'marked'],
             properties: {
               read: {
                 type: 'array',
                 items: { type: 'string' },
+              },
+              marked: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  additionalProperties: false,
+                  required: ['id', 'readAt'],
+                  properties: {
+                    id: { type: 'string' },
+                    readAt: { type: 'string' },
+                  },
+                },
               },
             },
           },
@@ -840,23 +860,33 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
     },
     async (request) => {
       const agent = caller(request);
-      const result = await pool.query<{ message_id: string }>(
+      const result = await pool.query<{
+        message_id: string;
+        read_at: Date | string | null;
+      }>(
         `UPDATE message_receipts
          SET read_at = COALESCE(read_at, clock_timestamp())
          WHERE agent_id = $1::uuid
            AND message_id IN (
              SELECT value::uuid FROM unnest($2::text[]) AS value
            )
-         RETURNING message_id`,
+         RETURNING message_id, read_at`,
         [agent.id, request.body.ids],
       );
-      const read = request.body.ids.flatMap((id) => {
-        const canonical = result.rows.find(
-          (row) => row.message_id.toLowerCase() === id.toLowerCase(),
-        );
-        return canonical ? [canonical.message_id] : [];
+      const byId = new Map(
+        result.rows.map((row) => [row.message_id.toLowerCase(), row]),
+      );
+      const marked = request.body.ids.flatMap((id) => {
+        const row = byId.get(id.toLowerCase());
+        if (row === undefined) {
+          return [];
+        }
+        return [{ id: row.message_id, readAt: requiredIsoTime(row.read_at) }];
       });
-      const body: ReadReceipt = { read };
+      const body: ReadReceipt = {
+        read: marked.map((item) => item.id),
+        marked,
+      };
       return body;
     },
   );
