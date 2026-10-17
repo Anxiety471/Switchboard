@@ -1,4 +1,5 @@
-import { beforeEach, expect, test } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import { beforeEach, expect, test, vi } from 'vitest';
 import { issueFormCsrf } from './desk';
 import {
   LOGIN_LIMIT_KEYS,
@@ -8,6 +9,7 @@ import {
   proxyHops,
   resetLoginLimits,
 } from './login-limit';
+import { enforceProxyHops } from './enforce-proxy-hops';
 import { handleDeskForm, type DeskFormInput } from './mutations';
 
 const SECRET = 'desk-secret-desk-secret-desk-secret';
@@ -20,7 +22,17 @@ beforeEach(() => {
 test('a trusted proxy counts the hop from the right', () => {
   expect(proxyHops(undefined)).toBe(1);
   expect(proxyHops('')).toBe(1);
+  expect(proxyHops(' 2 ')).toBe(2);
   expect(proxyHops('2')).toBe(2);
+  const unset = { ...process.env };
+  delete unset.TRUST_PROXY_HOPS;
+  enforceProxyHops(unset);
+  enforceProxyHops({ ...process.env, TRUST_PROXY_HOPS: '2' });
+  for (const value of ['0', '-1', '1.5', 'true', '01']) {
+    expect(() => proxyHops(value)).toThrow(
+      /^TRUST_PROXY_HOPS must be a positive integer$/,
+    );
+  }
   expect(
     deskClientKey({
       forwardedFor: '203.0.113.10, 198.51.100.1',
@@ -56,6 +68,99 @@ test('a trusted proxy counts the hop from the right', () => {
   expect(
     deskClientKey({ forwardedFor: null, trustProxy: true }),
   ).toBeUndefined();
+});
+
+test('an invalid hop count prints one line and exits non-zero', () => {
+  const moduleUrl = new URL('./login-limit.ts', import.meta.url);
+  const source = `import { ProxyHopsError, proxyHops } from ${JSON.stringify(moduleUrl.href)};
+try {
+  proxyHops('0');
+} catch (error) {
+  if (error instanceof ProxyHopsError) {
+    console.error(error.message);
+    process.exit(1);
+  }
+  throw error;
+}
+`;
+  const result = spawnSync(
+    process.execPath,
+    ['--experimental-strip-types', '--input-type=module', '-e', source],
+    {
+      encoding: 'utf8',
+      env: { ...process.env, NODE_NO_WARNINGS: '1' },
+    },
+  );
+  expect(result.status).toBe(1);
+  expect(result.stdout).toBe('');
+  expect(result.stderr.trim()).toBe(
+    'TRUST_PROXY_HOPS must be a positive integer',
+  );
+
+  const exit = vi.spyOn(process, 'exit').mockImplementation((() => {
+    throw new Error('exit');
+  }) as typeof process.exit);
+  const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    expect(() =>
+      enforceProxyHops({ ...process.env, TRUST_PROXY_HOPS: '-1' }),
+    ).toThrow('exit');
+    expect(logged).toHaveBeenCalledWith(
+      'TRUST_PROXY_HOPS must be a positive integer',
+    );
+    expect(exit).toHaveBeenCalledWith(1);
+  } finally {
+    exit.mockRestore();
+    logged.mockRestore();
+  }
+});
+
+test('ipv6 clients in one /64 share a bucket key', () => {
+  const prefix = '2001:db8:1:2';
+  for (let index = 1; index <= 1024; index += 1) {
+    expect(
+      deskClientKey({
+        forwardedFor: `203.0.113.1, ${prefix}::${index.toString(16)}`,
+        trustProxy: true,
+      }),
+    ).toBe(`fwd:${prefix}`);
+  }
+  expect(
+    deskClientKey({
+      forwardedFor: '2001:0DB8:0001:0002:ffff:0:0:2',
+      trustProxy: true,
+    }),
+  ).toBe(`fwd:${prefix}`);
+  expect(
+    deskClientKey({
+      forwardedFor: '2001:DB8:1:2:ffff::2',
+      trustProxy: true,
+    }),
+  ).toBe(`fwd:${prefix}`);
+  expect(
+    deskClientKey({
+      forwardedFor: '2001:db8:1:3::1',
+      trustProxy: true,
+    }),
+  ).toBe('fwd:2001:db8:1:3');
+  expect(
+    deskClientKey({
+      forwardedFor: '198.51.100.9',
+      trustProxy: true,
+    }),
+  ).toBe('fwd:198.51.100.9');
+  expect(
+    deskClientKey({
+      forwardedFor: 'gggg::1',
+      trustProxy: true,
+    }),
+  ).toBeUndefined();
+
+  const now = 1_700_000_000_000;
+  const shared = `fwd:${prefix}`;
+  lock(shared, now);
+  expect(loginLimited(shared, now)).toBe(true);
+  expect(loginLimited('fwd:2001:db8:1:3', now)).toBe(false);
 });
 
 function lock(key: string, now: number): void {
@@ -106,7 +211,7 @@ test('rotating addresses share an overflow bucket once every bucket is locked', 
   expect(loginLimited('after-window', now + WINDOW_MS)).toBe(false);
 });
 
-test('an overflow lock refuses the next new address at the desk', async () => {
+test('an overflow lock limits a wrong key and still signs in a correct key', async () => {
   const now = 1_700_000_000_000;
   for (let index = 0; index < LOGIN_LIMIT_KEYS; index += 1) {
     lock(`locked-${index}`, now);
@@ -175,5 +280,123 @@ test('an overflow lock refuses the next new address at the desk', async () => {
     cookies: [],
   });
   expect(directory.session).toBeUndefined();
+  expect(loginLimited('locked-0', now)).toBe(true);
+
+  form.set('password', SECRET);
+  const signedIn = await handleDeskForm(form, {
+    ...input,
+    clientKey: 'brand-new',
+  });
+  expect(signedIn).toMatchObject({ kind: 'redirect', location: '/' });
+  expect(directory.session).toBeDefined();
+  expect(loginLimited('locked-0', now)).toBe(true);
+  expect(loginLimited('still-new', now)).toBe(true);
+
+  form.set('password', 'nope');
+  expect(
+    await handleDeskForm(form, { ...input, clientKey: 'another-new' }),
+  ).toEqual({
+    kind: 'redirect',
+    location: '/?error=limited',
+    cookies: [],
+  });
+});
+
+test('overflow outcomes take the same time apart from the session cookie', async () => {
+  const now = 1_700_000_000_000;
+  for (let index = 0; index < LOGIN_LIMIT_KEYS; index += 1) {
+    lock(`locked-${index}`, now);
+  }
+  for (let index = 0; index < 8; index += 1) {
+    noteLoginFailure(`rotating-${index}`, now);
+  }
+  const csrf = issueFormCsrf(SECRET, now);
+  const directory = {
+    session: undefined as { id: string; csrfToken: string } | undefined,
+    openSession() {
+      return new Promise<{
+        ok: true;
+        value: { id: string; csrfToken: string };
+      }>((resolve) => {
+        setTimeout(() => {
+          this.session = {
+            id: 'session-id-session-id-session-id-sess',
+            csrfToken: 'csrf-token-csrf-token-csrf-token-csrf',
+          };
+          resolve({ ok: true, value: this.session });
+        }, 200);
+      });
+    },
+    closeSession() {
+      return Promise.resolve({ ok: true as const, value: true as const });
+    },
+    readSession() {
+      return Promise.resolve({
+        ok: false as const,
+        failure: 'not_found' as const,
+      });
+    },
+    saveNotice() {
+      return Promise.resolve({
+        ok: false as const,
+        failure: 'not_found' as const,
+      });
+    },
+    confirmHandover() {
+      return Promise.resolve({ ok: true as const, value: true as const });
+    },
+    discardPending() {
+      return Promise.resolve({ ok: true as const, value: true as const });
+    },
+  };
+  const input: DeskFormInput = {
+    env: {
+      DASHBOARD_SECRET: SECRET,
+      SWITCHBOARD_URL: 'http://127.0.0.1:3001',
+    },
+    secure: false,
+    origin: 'http://127.0.0.1:3000',
+    host: '127.0.0.1:3000',
+    sessionId: undefined,
+    tokenCookie: undefined,
+    clientKey: 'overflow-wrong',
+    now,
+    wrongGuessDelayMs: 500,
+    directory,
+  };
+  const wrongStarted = performance.now();
+  const wrong = await handleDeskForm(
+    (() => {
+      const form = new FormData();
+      form.set('intent', 'login');
+      form.set('password', 'nope');
+      form.set('csrf', csrf);
+      return form;
+    })(),
+    input,
+  );
+  const wrongElapsed = performance.now() - wrongStarted;
+  const rightStarted = performance.now();
+  const right = await handleDeskForm(
+    (() => {
+      const form = new FormData();
+      form.set('intent', 'login');
+      form.set('password', SECRET);
+      form.set('csrf', csrf);
+      return form;
+    })(),
+    { ...input, clientKey: 'overflow-right' },
+  );
+  const rightElapsed = performance.now() - rightStarted;
+  expect(wrong).toEqual({
+    kind: 'redirect',
+    location: '/?error=limited',
+    cookies: [],
+  });
+  expect(right).toMatchObject({ kind: 'redirect', location: '/' });
+  expect(directory.session).toBeDefined();
+  expect(wrongElapsed).toBeGreaterThanOrEqual(450);
+  expect(rightElapsed).toBeGreaterThanOrEqual(450);
+  expect(rightElapsed).toBeLessThan(wrongElapsed + 120);
   expect(loginLimited('locked-0', now)).toBe(true);
 });

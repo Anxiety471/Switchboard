@@ -24,7 +24,8 @@ const nextBin = path.join(
 );
 
 const children: ChildProcess[] = [];
-let closeApi: (() => Promise<void>) | undefined;
+const apiClosers: Array<() => Promise<void>> = [];
+const tally = { sessions: 0 };
 
 type Exchange = {
   status: number;
@@ -227,6 +228,7 @@ async function waitForReady(
 async function startDesk(options: {
   apiUrl: string;
   trustProxy: boolean;
+  hops?: string;
 }): Promise<{ port: number; child: ChildProcess }> {
   const port = await freePort();
   const env: NodeJS.ProcessEnv = {
@@ -234,9 +236,13 @@ async function startDesk(options: {
     DASHBOARD_SECRET: SECRET,
     SWITCHBOARD_URL: options.apiUrl,
     NEXT_TELEMETRY_DISABLED: '1',
+    NODE_NO_WARNINGS: '1',
   };
   delete env.COOKIE_SECURE;
   delete env.TRUST_PROXY_HOPS;
+  if (options.hops !== undefined) {
+    env.TRUST_PROXY_HOPS = options.hops;
+  }
   if (options.trustProxy) {
     env.TRUST_PROXY = '1';
   } else {
@@ -298,6 +304,55 @@ function postLogin(options: {
   });
 }
 
+function ipv4Block(prefix: string): string[] {
+  const addresses: string[] = [];
+  for (let host = 0; host < 256; host += 1) {
+    addresses.push(`${prefix}.${host}`);
+  }
+  return addresses;
+}
+
+async function eachAddress(
+  addresses: readonly string[],
+  concurrency: number,
+  visit: (address: string) => Promise<void>,
+): Promise<void> {
+  let cursor = 0;
+  const workers = Array.from(
+    { length: Math.min(concurrency, addresses.length) },
+    async () => {
+      while (cursor < addresses.length) {
+        const index = cursor;
+        cursor += 1;
+        const address = addresses[index];
+        if (address === undefined) {
+          return;
+        }
+        await visit(address);
+      }
+    },
+  );
+  await Promise.all(workers);
+}
+
+async function startApi(): Promise<string> {
+  const api = await listen((incoming, response) => {
+    if (incoming.headers['x-dashboard-secret'] !== SECRET) {
+      response.writeHead(401).end('{}');
+      return;
+    }
+    if (incoming.method === 'POST' && incoming.url === '/dashboard/sessions') {
+      tally.sessions += 1;
+      response.writeHead(201, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ id: SESSION_ID, csrfToken: CSRF }));
+      return;
+    }
+    response.writeHead(404).end('{}');
+  });
+  apiClosers.push(api.close);
+  return api.url;
+}
+
 beforeAll(async () => {
   await access(nextBin);
   await run('pnpm', ['--filter', '@switchboard/shared', 'build'], repoRoot);
@@ -306,29 +361,14 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await Promise.all(children.map((child) => stop(child)));
-  if (closeApi !== undefined) {
-    await closeApi();
-  }
+  await Promise.all(apiClosers.map((close) => close()));
 });
 
 test('a real desk rates logins by the proxy hop and delays only a wrong key', async () => {
-  let sessions = 0;
-  const api = await listen((incoming, response) => {
-    if (incoming.headers['x-dashboard-secret'] !== SECRET) {
-      response.writeHead(401).end('{}');
-      return;
-    }
-    if (incoming.method === 'POST' && incoming.url === '/dashboard/sessions') {
-      sessions += 1;
-      response.writeHead(201, { 'content-type': 'application/json' });
-      response.end(JSON.stringify({ id: SESSION_ID, csrfToken: CSRF }));
-      return;
-    }
-    response.writeHead(404).end('{}');
-  });
-  closeApi = api.close;
+  tally.sessions = 0;
+  const apiUrl = await startApi();
 
-  const open = await startDesk({ apiUrl: api.url, trustProxy: false });
+  const open = await startDesk({ apiUrl, trustProxy: false });
   const csrf = await loginCsrf(open.port);
   const started = Date.now();
   const wrongs = Array.from({ length: 8 }, () =>
@@ -353,7 +393,7 @@ test('a real desk rates logins by the proxy hop and delays only a wrong key', as
   expect(signedIn.setCookie.join('\n')).toContain(
     `switchboard_desk=${SESSION_ID}`,
   );
-  expect(sessions).toBe(1);
+  expect(tally.sessions).toBe(1);
   const denied = await Promise.all(wrongs);
   expect(Date.now() - started).toBeGreaterThanOrEqual(450);
   for (const attempt of denied) {
@@ -370,7 +410,7 @@ test('a real desk rates logins by the proxy hop and delays only a wrong key', as
   });
   expect(again.status).toBe(303);
   expect(again.location).toBe('/?error=unauthorized');
-  expect(sessions).toBe(1);
+  expect(tally.sessions).toBe(1);
 
   const page = await httpExchange({
     port: open.port,
@@ -383,8 +423,8 @@ test('a real desk rates logins by the proxy hop and delays only a wrong key', as
   expect(page.body).toContain('Desk key');
 
   await stop(open.child);
-  sessions = 0;
-  const proxied = await startDesk({ apiUrl: api.url, trustProxy: true });
+  tally.sessions = 0;
+  const proxied = await startDesk({ apiUrl, trustProxy: true });
   const proxyCsrf = await loginCsrf(proxied.port);
   for (let attempt = 0; attempt < 8; attempt += 1) {
     const denied = await postLogin({
@@ -408,7 +448,7 @@ test('a real desk rates logins by the proxy hop and delays only a wrong key', as
   expect(spoofed.status).toBe(303);
   expect(spoofed.location).toBe('/?error=limited');
   expect(spoofed.setCookie.join('\n')).not.toContain('switchboard_desk=');
-  expect(sessions).toBe(0);
+  expect(tally.sessions).toBe(0);
 
   const other = await postLogin({
     port: proxied.port,
@@ -422,7 +462,7 @@ test('a real desk rates logins by the proxy hop and delays only a wrong key', as
   expect(other.setCookie.join('\n')).toContain(
     `switchboard_desk=${SESSION_ID}`,
   );
-  expect(sessions).toBe(1);
+  expect(tally.sessions).toBe(1);
 
   const otherWrong = await postLogin({
     port: proxied.port,
@@ -444,3 +484,216 @@ test('a real desk rates logins by the proxy hop and delays only a wrong key', as
   expect(stillLocked.status).toBe(303);
   expect(stillLocked.location).toBe('/?error=limited');
 }, 120_000);
+
+test('a locked address takes the same time for a wrong key and the right key', async () => {
+  tally.sessions = 0;
+  const apiUrl = await startApi();
+  const desk = await startDesk({ apiUrl, trustProxy: true });
+  const csrf = await loginCsrf(desk.port);
+  const forwardedFor = '203.0.113.50';
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const denied = await postLogin({
+      port: desk.port,
+      localAddress: '127.0.0.1',
+      password: 'nope',
+      csrf,
+      forwardedFor,
+    });
+    expect(denied.status).toBe(303);
+    expect(denied.location).toBe('/?error=unauthorized');
+  }
+
+  const measure = async (password: string) => {
+    const started = Date.now();
+    const result = await postLogin({
+      port: desk.port,
+      localAddress: '127.0.0.1',
+      password,
+      csrf,
+      forwardedFor,
+    });
+    return { result, elapsed: Date.now() - started };
+  };
+  const wrong = await measure('nope');
+  const right = await measure(SECRET);
+  expect(wrong.result.status).toBe(303);
+  expect(right.result.status).toBe(303);
+  expect(wrong.result.location).toBe('/?error=limited');
+  expect(right.result.location).toBe('/?error=limited');
+  expect(right.result.setCookie.join('\n')).not.toContain('switchboard_desk=');
+  expect(tally.sessions).toBe(0);
+  expect(wrong.elapsed).toBeGreaterThanOrEqual(450);
+  expect(right.elapsed).toBeGreaterThanOrEqual(450);
+  expect(Math.abs(wrong.elapsed - right.elapsed)).toBeLessThan(200);
+  await stop(desk.child);
+}, 60_000);
+
+test('a full map still signs in a correct key from a new address', async () => {
+  tally.sessions = 0;
+  const apiUrl = await startApi();
+  const desk = await startDesk({ apiUrl, trustProxy: true });
+  const csrf = await loginCsrf(desk.port);
+  const addresses = [
+    ...ipv4Block('203.0.113'),
+    ...ipv4Block('198.51.100'),
+    ...ipv4Block('192.0.2'),
+    ...ipv4Block('198.51.101'),
+  ];
+  expect(addresses).toHaveLength(1024);
+  for (let wave = 0; wave < 8; wave += 1) {
+    await eachAddress(addresses, 128, async (address) => {
+      const denied = await postLogin({
+        port: desk.port,
+        localAddress: '127.0.0.1',
+        password: 'nope',
+        csrf,
+        forwardedFor: address,
+      });
+      expect(denied.status).toBe(303);
+      expect(denied.location).toBe('/?error=unauthorized');
+    });
+  }
+  for (let host = 1; host <= 8; host += 1) {
+    const denied = await postLogin({
+      port: desk.port,
+      localAddress: '127.0.0.1',
+      password: 'nope',
+      csrf,
+      forwardedFor: `203.0.114.${host}`,
+    });
+    expect(denied.status).toBe(303);
+    expect(denied.location).toBe('/?error=unauthorized');
+  }
+
+  const measure = async (password: string, forwardedFor: string) => {
+    const started = Date.now();
+    const result = await postLogin({
+      port: desk.port,
+      localAddress: '127.0.0.1',
+      password,
+      csrf,
+      forwardedFor,
+    });
+    return { result, elapsed: Date.now() - started };
+  };
+  const wrong = await measure('nope', '203.0.114.20');
+  const right = await measure(SECRET, '203.0.114.21');
+  expect(wrong.result.status).toBe(303);
+  expect(wrong.result.location).toBe('/?error=limited');
+  expect(wrong.result.setCookie.join('\n')).not.toContain('switchboard_desk=');
+  expect(right.result.status).toBe(303);
+  expect(right.result.location).toBe('/');
+  expect(right.result.setCookie.join('\n')).toContain(
+    `switchboard_desk=${SESSION_ID}`,
+  );
+  expect(tally.sessions).toBe(1);
+  expect(wrong.elapsed).toBeGreaterThanOrEqual(450);
+  expect(right.elapsed).toBeGreaterThanOrEqual(450);
+  expect(Math.abs(wrong.elapsed - right.elapsed)).toBeLessThan(250);
+
+  const stillLocked = await postLogin({
+    port: desk.port,
+    localAddress: '127.0.0.1',
+    password: SECRET,
+    csrf,
+    forwardedFor: '203.0.113.10',
+  });
+  expect(stillLocked.status).toBe(303);
+  expect(stillLocked.location).toBe('/?error=limited');
+  expect(stillLocked.setCookie.join('\n')).not.toContain('switchboard_desk=');
+  expect(tally.sessions).toBe(1);
+  await stop(desk.child);
+}, 180_000);
+
+test('addresses in one IPv6 /64 share one bucket', async () => {
+  tally.sessions = 0;
+  const apiUrl = await startApi();
+  const desk = await startDesk({ apiUrl, trustProxy: true });
+  const csrf = await loginCsrf(desk.port);
+  const addresses = Array.from({ length: 1024 }, (_value, index) => {
+    return `2001:db8:1:2::${(index + 1).toString(16)}`;
+  });
+  await eachAddress(addresses, 128, async (address) => {
+    const denied = await postLogin({
+      port: desk.port,
+      localAddress: '127.0.0.1',
+      password: 'nope',
+      csrf,
+      forwardedFor: `198.51.100.9, ${address}`,
+    });
+    expect(denied.status).toBe(303);
+    expect(['/?error=unauthorized', '/?error=limited']).toContain(
+      denied.location,
+    );
+  });
+
+  const samePrefix = await postLogin({
+    port: desk.port,
+    localAddress: '127.0.0.1',
+    password: SECRET,
+    csrf,
+    forwardedFor: '2001:0db8:0001:0002:ffff::2',
+  });
+  expect(samePrefix.status).toBe(303);
+  expect(samePrefix.location).toBe('/?error=limited');
+  expect(samePrefix.setCookie.join('\n')).not.toContain('switchboard_desk=');
+  expect(tally.sessions).toBe(0);
+
+  const otherPrefix = await postLogin({
+    port: desk.port,
+    localAddress: '127.0.0.1',
+    password: SECRET,
+    csrf,
+    forwardedFor: '2001:db8:1:3::1',
+  });
+  expect(otherPrefix.status).toBe(303);
+  expect(otherPrefix.location).toBe('/');
+  expect(otherPrefix.setCookie.join('\n')).toContain(
+    `switchboard_desk=${SESSION_ID}`,
+  );
+  expect(tally.sessions).toBe(1);
+  await stop(desk.child);
+}, 60_000);
+
+test('an invalid TRUST_PROXY_HOPS stops next start with one line', async () => {
+  for (const hops of ['0', '-1', '1.5']) {
+    const port = await freePort();
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      DASHBOARD_SECRET: SECRET,
+      SWITCHBOARD_URL: 'http://127.0.0.1:9',
+      TRUST_PROXY_HOPS: hops,
+      NEXT_TELEMETRY_DISABLED: '1',
+      NODE_NO_WARNINGS: '1',
+    };
+    delete env.COOKIE_SECURE;
+    const child = spawn(
+      process.execPath,
+      [nextBin, 'start', '-H', '127.0.0.1', '-p', String(port)],
+      { cwd: webRoot, env, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    children.push(child);
+    let stderr = '';
+    let stdout = '';
+    child.stderr?.on('data', (chunk: Buffer) => {
+      stderr = `${stderr}${chunk.toString('utf8')}`;
+    });
+    child.stdout?.on('data', (chunk: Buffer) => {
+      stdout = `${stdout}${chunk.toString('utf8')}`;
+    });
+    const code = await new Promise<number | null>((resolve) => {
+      const timer = setTimeout(() => {
+        child.kill('SIGKILL');
+        resolve(null);
+      }, 20_000);
+      child.once('exit', (status) => {
+        clearTimeout(timer);
+        resolve(status);
+      });
+    });
+    expect(code, `stdout:\n${stdout}\nstderr:\n${stderr}`).not.toBe(0);
+    expect(code).not.toBeNull();
+    expect(stderr.trim()).toBe('TRUST_PROXY_HOPS must be a positive integer');
+    expect(stderr).not.toContain('\n    at ');
+  }
+}, 60_000);

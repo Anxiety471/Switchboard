@@ -373,6 +373,44 @@ test('without a client address there is no rate limit', async () => {
   expect(directory.session).toBeDefined();
 });
 
+test('a locked address waits the same time for a wrong key and the right key', async () => {
+  const directory = memoryDirectory();
+  const csrf = issueFormCsrf(SECRET);
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    await handleDeskForm(
+      fields({ intent: 'login', password: 'nope', csrf }),
+      input(directory, { clientKey: 'timed-lock' }),
+    );
+  }
+  const measure = async (password: string) => {
+    const started = performance.now();
+    const result = await handleDeskForm(
+      fields({ intent: 'login', password, csrf }),
+      input(directory, {
+        clientKey: 'timed-lock',
+        wrongGuessDelayMs: 500,
+      }),
+    );
+    return { result, elapsed: performance.now() - started };
+  };
+  const wrong = await measure('nope');
+  const right = await measure(SECRET);
+  expect(wrong.result).toEqual({
+    kind: 'redirect',
+    location: '/?error=limited',
+    cookies: [],
+  });
+  expect(right.result).toEqual({
+    kind: 'redirect',
+    location: '/?error=limited',
+    cookies: [],
+  });
+  expect(wrong.elapsed).toBeGreaterThanOrEqual(450);
+  expect(right.elapsed).toBeGreaterThanOrEqual(450);
+  expect(Math.abs(wrong.elapsed - right.elapsed)).toBeLessThan(200);
+  expect(directory.session).toBeUndefined();
+});
+
 test('parallel wrong guesses do not delay a correct login', async () => {
   const directory = memoryDirectory();
   const csrf = issueFormCsrf(SECRET);

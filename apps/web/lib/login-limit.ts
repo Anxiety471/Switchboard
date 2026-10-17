@@ -72,17 +72,33 @@ function fullOfLocks(store: Map<string, Bucket>): boolean {
   return true;
 }
 
-export function loginLimited(key: string, now = Date.now()): boolean {
+export type DeskLoginPlacement = 'open' | 'locked' | 'overflow';
+
+export function loginPlacement(
+  key: string,
+  now = Date.now(),
+): DeskLoginPlacement {
   const { buckets: store, overflow } = memory();
   prune(store, overflow, now);
   const bucket = store.get(key);
   if (bucket !== undefined) {
-    return locked(bucket);
+    return locked(bucket) ? 'locked' : 'open';
   }
-  if (!fullOfLocks(store)) {
+  if (fullOfLocks(store)) {
+    return 'overflow';
+  }
+  return 'open';
+}
+
+export function loginLimited(key: string, now = Date.now()): boolean {
+  const placement = loginPlacement(key, now);
+  if (placement === 'locked') {
+    return true;
+  }
+  if (placement !== 'overflow') {
     return false;
   }
-  return overflow.length >= MAX_FAILURES;
+  return memory().overflow.length >= MAX_FAILURES;
 }
 
 export function noteLoginFailure(key: string, now = Date.now()): void {
@@ -119,18 +135,82 @@ export function trustProxyEnabled(value: string | undefined): boolean {
   return value !== undefined && value !== '';
 }
 
+export class ProxyHopsError extends Error {
+  constructor() {
+    super('TRUST_PROXY_HOPS must be a positive integer');
+    this.name = 'ProxyHopsError';
+  }
+}
+
 export function proxyHops(value: string | undefined): number {
   if (value === undefined || value.trim() === '') {
     return 1;
   }
-  if (!/^[1-9]\d*$/.test(value.trim())) {
-    return 1;
+  const trimmed = value.trim();
+  if (!/^[1-9]\d*$/.test(trimmed)) {
+    throw new ProxyHopsError();
   }
-  const parsed = Number(value);
+  const parsed = Number(trimmed);
   if (!Number.isSafeInteger(parsed)) {
-    return 1;
+    throw new ProxyHopsError();
   }
   return parsed;
+}
+
+function ipv6Prefix(address: string): string | undefined {
+  const halves = address.toLowerCase().split('::');
+  if (halves.length > 2) {
+    return undefined;
+  }
+  const parseSide = (side: string): string[] | undefined => {
+    if (side === '') {
+      return [];
+    }
+    const groups = side.split(':');
+    if (groups.some((group) => group === '')) {
+      return undefined;
+    }
+    return groups;
+  };
+  const head = parseSide(halves[0] ?? '');
+  if (head === undefined) {
+    return undefined;
+  }
+  let groups: string[];
+  if (halves.length === 1) {
+    groups = head;
+  } else {
+    const tail = parseSide(halves[1] ?? '');
+    if (tail === undefined) {
+      return undefined;
+    }
+    const missing = 8 - head.length - tail.length;
+    if (missing < 1) {
+      return undefined;
+    }
+    groups = [...head, ...Array.from({ length: missing }, () => '0'), ...tail];
+  }
+  if (groups.length !== 8) {
+    return undefined;
+  }
+  const parsed: number[] = [];
+  for (const group of groups) {
+    if (!/^[0-9a-f]{1,4}$/.test(group)) {
+      return undefined;
+    }
+    parsed.push(Number.parseInt(group, 16));
+  }
+  return parsed
+    .slice(0, 4)
+    .map((value) => value.toString(16))
+    .join(':');
+}
+
+function bucketAddress(address: string): string | undefined {
+  if (!address.includes(':')) {
+    return address;
+  }
+  return ipv6Prefix(address);
 }
 
 function forwardedClient(
@@ -170,5 +250,9 @@ export function deskClientKey(input: {
   if (forwarded === undefined) {
     return undefined;
   }
-  return `fwd:${forwarded}`;
+  const address = bucketAddress(forwarded);
+  if (address === undefined) {
+    return undefined;
+  }
+  return `fwd:${address}`;
 }

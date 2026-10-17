@@ -22,6 +22,7 @@ import {
 import {
   clearLoginFailures,
   loginLimited,
+  loginPlacement,
   noteLoginFailure,
 } from './login-limit';
 import {
@@ -233,29 +234,39 @@ export async function handleDeskForm(
     if (!formCsrfValid(config.secret, csrfField(form), now)) {
       return status(403);
     }
-    const password = form.get('password');
-    const presented = typeof password === 'string' ? password : '';
-    const accepted = secretsEqual(config.secret, presented);
     const clientKey = input.clientKey;
     const delayMs = input.wrongGuessDelayMs ?? WRONG_GUESS_DELAY_MS;
-    if (clientKey !== undefined && loginLimited(clientKey, now)) {
-      if (!accepted) {
-        await wait(delayMs);
-      }
+    const placement =
+      clientKey === undefined ? 'open' : loginPlacement(clientKey, now);
+    if (placement === 'locked') {
+      await wait(delayMs);
       return redirect('/?error=limited');
     }
+    const password = form.get('password');
+    const presented = typeof password === 'string' ? password : '';
+    const started = performance.now();
+    const accepted = secretsEqual(config.secret, presented);
+    const overflowTripped =
+      placement === 'overflow' &&
+      clientKey !== undefined &&
+      loginLimited(clientKey, now);
     if (!accepted) {
       if (clientKey !== undefined) {
         noteLoginFailure(clientKey, now);
       }
       await wait(delayMs);
+      if (overflowTripped) {
+        return redirect('/?error=limited');
+      }
       return redirect('/?error=unauthorized');
     }
     const opened = await directory.openSession(config);
     if (!opened.ok) {
       return redirect(`/?error=${opened.failure}`);
     }
-    if (clientKey !== undefined) {
+    if (placement === 'overflow') {
+      await wait(delayMs - (performance.now() - started));
+    } else if (clientKey !== undefined) {
       clearLoginFailures(clientKey);
     }
     return redirect('/', [
