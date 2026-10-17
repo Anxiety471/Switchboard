@@ -139,6 +139,13 @@ test('migration creates agents, messages, and per-recipient receipts', async () 
        AND indexname = 'agents_name_lower_idx'`,
   );
   expect(index.rowCount).toBe(1);
+
+  const uniqueName = await admin.query(
+    `SELECT 1
+     FROM pg_constraint
+     WHERE conname = 'agents_name_unique'`,
+  );
+  expect(uniqueName.rowCount).toBe(0);
 });
 
 test('POST /agents returns a token once and stores only its hash', async () => {
@@ -856,5 +863,49 @@ test('POST /agents requires the registration secret when it is set', async () =>
     expect(listed.body).not.toContain(token);
   } finally {
     await guarded.close();
+  }
+});
+
+test('messages resolve recipients without matching case', async () => {
+  const alpha = await register('alpha');
+  const beta = await register('beta');
+  const sent = await send(alpha.token, { to: 'Beta', body: 'hello' });
+  const page = await inbox(beta.token, true);
+  expect(page.messages.map((message) => message.id)).toEqual([sent.id]);
+  expect(page.messages[0]).toMatchObject({
+    from: 'alpha',
+    to: 'beta',
+    body: 'hello',
+  });
+
+  const self = await app.inject({
+    method: 'POST',
+    url: '/messages',
+    headers: bearer(alpha.token),
+    payload: { to: 'ALPHA', body: 'nope' },
+  });
+  expect(self.statusCode).toBe(400);
+  expect(self.json()).toEqual({ error: 'invalid request' });
+  const count = await admin.query<{ count: number }>(
+    'SELECT count(*)::int AS count FROM messages',
+  );
+  expect(count.rows[0]?.count).toBe(1);
+});
+
+test('GET /inbox rejects cursor dates Postgres cannot store', async () => {
+  const alpha = await register('alpha');
+  const id = '00000000-0000-4000-8000-000000000001';
+  for (const createdAt of [
+    '2026-02-30T00:00:00.000Z',
+    '0000-01-01T00:00:00.000Z',
+  ]) {
+    const params = new URLSearchParams({ after: `${createdAt}|${id}` });
+    const response = await app.inject({
+      method: 'GET',
+      url: `/inbox?${params.toString()}`,
+      headers: bearer(alpha.token),
+    });
+    expect(response.statusCode, createdAt).toBe(400);
+    expect(response.json()).toEqual({ error: 'invalid request' });
   }
 });

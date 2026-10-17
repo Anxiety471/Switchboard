@@ -35,6 +35,24 @@ const REDACT_PATHS = [
 ];
 
 const NAME_CONFLICTS = new Set(['agents_name_unique', 'agents_name_lower_idx']);
+const CONNECTION_ERRORS = new Set([
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'EPIPE',
+  '08000',
+  '08001',
+  '08003',
+  '08004',
+  '08006',
+  '57P01',
+  '57P02',
+  '57P03',
+]);
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -190,6 +208,15 @@ function inboxLimit(value: string | undefined): number | undefined {
   return parsed;
 }
 
+function isCursorTime(value: string): boolean {
+  const year = Number(value.slice(0, 4));
+  if (!Number.isInteger(year) || year < 1 || year > 9999) {
+    return false;
+  }
+  const parsed = new Date(value);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
+}
+
 function parseCursor(
   value: string | undefined,
 ): InboxCursor | null | undefined {
@@ -199,14 +226,24 @@ function parseCursor(
   const match = CURSOR_PATTERN.exec(value);
   const createdAt = match?.[1];
   const id = match?.[2];
-  if (
-    createdAt === undefined ||
-    id === undefined ||
-    Number.isNaN(Date.parse(createdAt))
-  ) {
+  if (createdAt === undefined || id === undefined || !isCursorTime(createdAt)) {
     return undefined;
   }
   return { createdAt, id };
+}
+
+function isDatabaseUnavailable(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null || !('code' in error)) {
+    return false;
+  }
+  const code = error.code;
+  if (typeof code === 'string' && CONNECTION_ERRORS.has(code)) {
+    return true;
+  }
+  if ('errors' in error && Array.isArray(error.errors)) {
+    return error.errors.some((item) => isDatabaseUnavailable(item));
+  }
+  return false;
 }
 
 function registrationHeader(headers: IncomingHttpHeaders): string {
@@ -354,8 +391,10 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
     if (token === undefined) {
       return reply.code(401).send({ error: 'unauthorized' });
     }
-    const result = await pool.query<{ id: string; name: string }>(
-      `WITH touched AS (
+    let result;
+    try {
+      result = await pool.query<{ id: string; name: string }>(
+        `WITH touched AS (
          UPDATE agents
          SET last_seen_at = clock_timestamp()
          WHERE token_hash = $1
@@ -367,8 +406,15 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
        SELECT id, name
        FROM agents
        WHERE token_hash = $1`,
-      [hashToken(token)],
-    );
+        [hashToken(token)],
+      );
+    } catch (error) {
+      if (isDatabaseUnavailable(error)) {
+        app.log.error({ err: error }, 'database auth check failed');
+        return reply.code(503).send({ ok: false });
+      }
+      throw error;
+    }
     const row = result.rows[0];
     if (row === undefined) {
       return reply.code(401).send({ error: 'unauthorized' });
@@ -783,17 +829,17 @@ async function resolveRecipient(
     await reply.code(400).send({ error: 'invalid request' });
     return undefined;
   }
-  if (to === sender.name) {
-    await reply.code(400).send({ error: 'invalid request' });
-    return undefined;
-  }
   const result = await pool.query<{ id: string }>(
-    'SELECT id FROM agents WHERE name = $1',
+    'SELECT id FROM agents WHERE lower(name) = lower($1)',
     [to],
   );
   const row = result.rows[0];
   if (row === undefined) {
     await reply.code(404).send({ error: 'recipient not found' });
+    return undefined;
+  }
+  if (row.id === sender.id) {
+    await reply.code(400).send({ error: 'invalid request' });
     return undefined;
   }
   return row.id;
