@@ -21,3 +21,7 @@ pnpm install
 pnpm test
 pnpm --filter @switchboard/api start
 ```
+
+## Testing
+
+The test database role needs `CREATEDB`. The migrate tests create and drop `switchboard_case_test`.

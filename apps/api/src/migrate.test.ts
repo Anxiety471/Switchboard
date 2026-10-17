@@ -76,6 +76,68 @@ test('a slow migration statement is not cancelled', async () => {
   }
 });
 
+test('a timed-out migration destroys the client instead of resetting', async () => {
+  const pool = new Pool({
+    connectionString: databaseUrl,
+    statement_timeout: 2000,
+    query_timeout: 2500,
+    max: 1,
+  });
+  pool.on('error', () => undefined);
+  const directory = await mkdtemp(join(tmpdir(), 'switchboard-migrate-'));
+  const version = `900_timeout_${Date.now()}.sql`;
+  await writeFile(join(directory, version), 'SELECT pg_sleep(30)');
+  const timeoutMs = 1000;
+  const admin = new Client({
+    connectionString: databaseUrl,
+    statement_timeout: 2000,
+  });
+  admin.on('error', () => undefined);
+  await admin.connect();
+  const started = Date.now();
+  try {
+    await expect(migrate(pool, directory, timeoutMs)).rejects.toThrow(
+      /Query read timeout/,
+    );
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeGreaterThanOrEqual(timeoutMs - 50);
+    expect(elapsed).toBeLessThan(timeoutMs * 2);
+    expect(pool.totalCount).toBe(0);
+    expect(pool.idleCount).toBe(0);
+  } finally {
+    const leftover = await admin
+      .query<{ pid: number }>(
+        `SELECT pid
+         FROM pg_stat_activity
+         WHERE pid <> pg_backend_pid()
+           AND query LIKE '%pg_sleep(30)%'`,
+      )
+      .catch(() => undefined);
+    for (const row of leftover?.rows ?? []) {
+      await admin
+        .query('SELECT pg_terminate_backend($1)', [row.pid])
+        .catch(() => undefined);
+    }
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const still = await admin
+        .query(
+          `SELECT 1
+           FROM pg_stat_activity
+           WHERE pid <> pg_backend_pid()
+             AND query LIKE '%pg_sleep(30)%'`,
+        )
+        .catch(() => undefined);
+      if ((still?.rowCount ?? 0) === 0) {
+        break;
+      }
+      await delay(50);
+    }
+    await admin.end().catch(() => undefined);
+    await pool.end().catch(() => undefined);
+    await rm(directory, { recursive: true, force: true });
+  }
+}, 15_000);
+
 test('an upgrade renames case-variant agent names before the unique index', async () => {
   const caseUrl = databaseUrlFor('switchboard_case_test');
   const admin = new Client({ connectionString: databaseUrl });

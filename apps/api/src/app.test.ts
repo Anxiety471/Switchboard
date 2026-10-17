@@ -251,7 +251,14 @@ test('GET /health survives pg_terminate_backend', async () => {
 });
 
 test('GET /agents returns 503 while agents is exclusively locked', async () => {
-  const lockedApp = buildApp(databaseUrl);
+  const logs: string[] = [];
+  const lockedApp = buildApp(databaseUrl, {
+    logStream: {
+      write(message) {
+        logs.push(message);
+      },
+    },
+  });
   const locker = new Client({ connectionString: databaseUrl });
   try {
     await lockedApp.migrationsReady;
@@ -296,6 +303,12 @@ test('GET /agents returns 503 while agents is exclusively locked', async () => {
     });
     expect(recovered.statusCode).toBe(401);
     expect(recovered.body).toBe('{"error":"unauthorized"}');
+    const authFailures = logs.filter(
+      (line) =>
+        line.includes('database auth check failed') &&
+        line.includes('"code":"57014"'),
+    );
+    expect(authFailures).toHaveLength(5);
   } finally {
     await locker.end().catch(() => undefined);
     await lockedApp.close();

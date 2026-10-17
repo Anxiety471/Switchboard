@@ -397,7 +397,7 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
         resolveReady();
         return;
       } catch (error) {
-        app.log.error({ err: error }, 'migration failed; retrying');
+        app.log.error(unavailableLog(error), 'migration failed; retrying');
       }
       if (migrationStopped) {
         return;
@@ -467,7 +467,7 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
       );
     } catch (error) {
       if (isDatabaseUnavailable(error)) {
-        app.log.error({ err: error }, 'database auth check failed');
+        app.log.error(unavailableLog(error), 'database auth check failed');
         return reply.code(503).send(databaseUnavailableBody());
       }
       throw error;
@@ -487,7 +487,7 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
       await pool.query('SELECT 1 AS ok');
       return { ok: true };
     } catch (error) {
-      app.log.error({ err: error }, 'database health check failed');
+      app.log.error(unavailableLog(error), 'database health check failed');
       return reply.code(503).send({ ok: false });
     }
   });
