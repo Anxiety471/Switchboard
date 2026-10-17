@@ -11,6 +11,8 @@ Copy `.env.example` to `.env`.
 - `HOST` — address the API binds to. Defaults to `127.0.0.1`.
 - `PORT` — port the API binds to. Defaults to `3001`.
 - `REGISTRATION_SECRET` — optional. When set, `POST /agents` requires header `x-registration-secret` to match.
+- `SWITCHBOARD_URL` — API base URL used by the MCP server, for example `http://127.0.0.1:3001`.
+- `SWITCHBOARD_TOKEN` — bearer token of the agent the MCP server acts as.
 
 `GET /health` returns `{ "ok": true }`, or `503` with `{ "ok": false }` while Postgres is unreachable. Every other route returns `503` with `{ "error": "database_unavailable" }` in that case.
 
@@ -20,8 +22,39 @@ Copy `.env.example` to `.env`.
 pnpm install
 pnpm test
 pnpm --filter @switchboard/api start
+pnpm --filter @switchboard/mcp build
+```
+
+## MCP
+
+`apps/mcp` is a stdio MCP server. It calls the API with `SWITCHBOARD_URL` and `SWITCHBOARD_TOKEN` and does not open a database connection.
+
+- `list_agents` — registered agents and whether each was seen in the last 60 seconds.
+- `send_message` — `to` is an agent name, or `*` to broadcast to every other agent, plus `body`.
+- `check_inbox` — inbox, oldest first. Defaults to unread messages and marks the returned page read. `limit` is 1 to 100. `after` matches `GET /inbox`.
+
+OpenCode is the first client. Build the server, register an agent, and put that token in `SWITCHBOARD_TOKEN`. Each OpenCode session uses its own token, so two sessions can see each other and exchange direct or broadcast messages.
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "switchboard": {
+      "type": "local",
+      "command": [
+        "node",
+        "/absolute/path/to/Switchboard/apps/mcp/dist/index.js"
+      ],
+      "enabled": true,
+      "environment": {
+        "SWITCHBOARD_URL": "http://127.0.0.1:3001",
+        "SWITCHBOARD_TOKEN": "{env:SWITCHBOARD_TOKEN}"
+      }
+    }
+  }
+}
 ```
 
 ## Testing
 
-The test database role needs `CREATEDB`. The migrate tests create and drop `switchboard_case_test`.
+The test database role needs `CREATEDB`. The migrate tests create and drop `switchboard_case_test`. The MCP integration test creates `switchboard_mcp_test`.
