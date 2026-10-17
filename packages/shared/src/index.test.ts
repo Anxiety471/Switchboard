@@ -1,7 +1,10 @@
 import { expect, test } from 'vitest';
-import type { AgentId } from './index.js';
+import { isAgentId } from './index.js';
 
-test('AgentId accepts a string', () => {
-  const id: AgentId = 'agent_1';
-  expect(id).toBe('agent_1');
+test('isAgentId accepts non-empty strings', () => {
+  expect(isAgentId('agent_1')).toBe(true);
+  expect(isAgentId('')).toBe(false);
+  expect(isAgentId('   ')).toBe(false);
+  expect(isAgentId(1)).toBe(false);
+  expect(isAgentId(null)).toBe(false);
 });
