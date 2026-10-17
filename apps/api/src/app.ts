@@ -1,6 +1,6 @@
 import type { IncomingHttpHeaders } from 'node:http';
 import Fastify, { type FastifyError } from 'fastify';
-import { Pool } from 'pg';
+import { Pool, type PoolClient } from 'pg';
 import type {
   AgentSummary,
   InboxMessage,
@@ -23,6 +23,7 @@ const MIGRATION_RETRY_MAX_MS = 5000;
 const CONNECTION_TIMEOUT_MS = 2000;
 const STATEMENT_TIMEOUT_MS = 2000;
 const QUERY_TIMEOUT_MS = 2500;
+const KEEPALIVE_INITIAL_DELAY_MS = 10_000;
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const UUID_PATTERN =
   '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';
@@ -279,6 +280,14 @@ function databaseUnavailableBody(): { error: 'database_unavailable' } {
   return { error: 'database_unavailable' };
 }
 
+function unavailableLog(error: unknown): { err: unknown; code?: string } {
+  const code = pgField(error, 'code');
+  if (code === undefined) {
+    return { err: error };
+  }
+  return { err: error, code };
+}
+
 function registrationHeader(headers: IncomingHttpHeaders): string {
   const header = headers['x-registration-secret'];
   return typeof header === 'string' ? header : '';
@@ -290,6 +299,8 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
     connectionTimeoutMillis: CONNECTION_TIMEOUT_MS,
     query_timeout: QUERY_TIMEOUT_MS,
     statement_timeout: STATEMENT_TIMEOUT_MS,
+    keepAlive: true,
+    keepAliveInitialDelayMillis: KEEPALIVE_INITIAL_DELAY_MS,
     max: options?.max ?? 10,
   });
   const logging = options?.logger === true || options?.logStream !== undefined;
@@ -297,6 +308,13 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
   let migrated = options?.migrate === false;
   let migrationStopped = false;
   let wake: (() => void) | undefined;
+  const checkedOut = new Set<PoolClient>();
+  pool.on('acquire', (client) => {
+    checkedOut.add(client);
+  });
+  pool.on('release', (_error, client) => {
+    checkedOut.delete(client);
+  });
   let resolveReady: () => void = () => {};
   const migrationsReady = new Promise<void>((resolve) => {
     resolveReady = resolve;
@@ -393,7 +411,7 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
 
   app.setErrorHandler((error, _request, reply) => {
     if (isDatabaseUnavailable(error)) {
-      app.log.error({ err: error }, 'database unavailable');
+      app.log.error(unavailableLog(error), 'database unavailable');
       return reply.code(503).send(databaseUnavailableBody());
     }
     const statusCode = statusCodeOf(error);
@@ -536,7 +554,7 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
           return reply.code(409).send({ error: 'name already registered' });
         }
         if (isDatabaseUnavailable(error)) {
-          app.log.error({ err: error }, 'database unavailable');
+          app.log.error(unavailableLog(error), 'database unavailable');
           return reply.code(503).send(databaseUnavailableBody());
         }
         throw error;
@@ -848,6 +866,13 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
   app.addHook('onClose', async () => {
     migrationStopped = true;
     wake?.();
+    const active = [...checkedOut];
+    await Promise.all(
+      active.map(async (client) => {
+        client.on('error', () => undefined);
+        await client.end();
+      }),
+    );
     await migrationTask;
     await pool.end();
   });

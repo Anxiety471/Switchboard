@@ -39,8 +39,16 @@ test('GET /health queries postgres', async () => {
 });
 
 test('GET /health returns 503 when postgres is unreachable', async () => {
+  const logs: string[] = [];
   const down = buildApp(
     'postgres://switchboard_user:s3cret-pass@127.0.0.1:1/unreachable_test',
+    {
+      logStream: {
+        write(message) {
+          logs.push(message);
+        },
+      },
+    },
   );
 
   try {
@@ -77,6 +85,12 @@ test('GET /health returns 503 when postgres is unreachable', async () => {
     expect(registeredBody).not.toMatch(
       /ECONNREFUSED|switchboard_user|s3cret-pass|unreachable_test/,
     );
+    const unavailable = logs.filter((line) =>
+      line.includes('database unavailable'),
+    );
+    expect(
+      unavailable.some((line) => line.includes('"code":"ECONNREFUSED"')),
+    ).toBe(true);
   } finally {
     await down.close();
   }
@@ -258,19 +272,16 @@ test('GET /agents returns 503 while agents is exclusively locked', async () => {
       try {
         const outcome = await Promise.race([
           responsePromise,
-          delay(5000).then(() => ({ kind: 'hung' as const })),
+          delay(2400).then(() => ({ kind: 'hung' as const })),
         ]);
+        const elapsed = Date.now() - lockedAt;
         if (outcome.kind === 'hung') {
           void responsePromise.catch(() => undefined);
           throw new Error(
-            `GET /agents stayed blocked on the agents lock (attempt ${attempt})`,
+            `GET /agents did not return within 2.4s (attempt ${attempt}, ${elapsed}ms)`,
           );
         }
-        const held = Date.now() - lockedAt;
-        if (held < 3100) {
-          await delay(3100 - held);
-        }
-        expect(Date.now() - lockedAt).toBeGreaterThanOrEqual(3000);
+        expect(elapsed).toBeLessThan(2400);
         expect(outcome.response.statusCode).toBe(503);
         expect(outcome.response.body).toBe('{"error":"database_unavailable"}');
       } finally {

@@ -7,6 +7,7 @@ import { expect, test } from 'vitest';
 import { buildApp } from './app.js';
 import { migrate } from './migrate.js';
 import { assertTestDatabaseUrl } from './test-helpers/test-database.js';
+import { generateToken, hashToken } from './token.js';
 
 const databaseUrl = assertTestDatabaseUrl(process.env.TEST_DATABASE_URL);
 
@@ -87,6 +88,14 @@ test('an upgrade renames case-variant agent names before the unique index', asyn
   const pool = new Pool({ connectionString: caseUrl, max: 1 });
   setup.on('error', () => undefined);
   pool.on('error', () => undefined);
+  const olderToken = generateToken();
+  const newerToken = generateToken();
+  const thirdToken = generateToken();
+  const takenToken = generateToken();
+  const longKeeperToken = generateToken();
+  const longRenamedToken = generateToken();
+  const longKeeper = `m${'a'.repeat(63)}`;
+  const longRenamed = `M${'A'.repeat(63)}`;
   let app: ReturnType<typeof buildApp> | undefined;
   try {
     await setup.connect();
@@ -96,11 +105,63 @@ test('an upgrade renames case-variant agent names before the unique index', asyn
         'utf8',
       ),
     );
-    await setup.query(
+    const inserted = await setup.query<{ id: string; name: string }>(
       `INSERT INTO agents (name, token_hash, created_at)
        VALUES
-         ('Alpha', decode(repeat('11', 32), 'hex'), timestamptz '2020-01-01'),
-         ('alpha', decode(repeat('22', 32), 'hex'), timestamptz '2020-01-02')`,
+         ($1, $2, timestamptz '2020-01-01'),
+         ($3, $4, timestamptz '2020-01-02'),
+         ($5, $6, timestamptz '2020-01-03'),
+         ($7, $8, timestamptz '2020-01-04'),
+         ($9, $10, timestamptz '2020-01-05'),
+         ($11, $12, timestamptz '2020-01-06')
+       RETURNING id, name`,
+      [
+        'Alpha',
+        hashToken(olderToken),
+        'alpha',
+        hashToken(newerToken),
+        'ALPHA',
+        hashToken(thirdToken),
+        'alpha-2',
+        hashToken(takenToken),
+        longKeeper,
+        hashToken(longKeeperToken),
+        longRenamed,
+        hashToken(longRenamedToken),
+      ],
+    );
+    const idByName = new Map(inserted.rows.map((row) => [row.name, row.id]));
+    const olderId = idByName.get('Alpha');
+    const newerId = idByName.get('alpha');
+    if (olderId === undefined || newerId === undefined) {
+      throw new Error('expected both case variants');
+    }
+    const messages = await setup.query<{
+      id: string;
+      from_agent: string;
+      to_agent: string;
+      body: string;
+    }>(
+      `INSERT INTO messages (from_agent, to_agent, body)
+       VALUES ($1::uuid, $2::uuid, 'older-to-newer'),
+              ($2::uuid, $1::uuid, 'newer-to-older')
+       RETURNING id, from_agent, to_agent, body`,
+      [olderId, newerId],
+    );
+    await setup.query(
+      `INSERT INTO message_receipts (message_id, agent_id)
+       SELECT id, to_agent FROM messages`,
+    );
+    const receiptsBefore = await setup.query<{
+      message_id: string;
+      agent_id: string;
+    }>(
+      `SELECT message_id, agent_id
+       FROM message_receipts
+       ORDER BY message_id, agent_id`,
+    );
+    const hashesBefore = await setup.query<{ id: string; token_hash: Buffer }>(
+      'SELECT id, token_hash FROM agents ORDER BY id',
     );
     await setup.query(`
       CREATE TABLE schema_migrations (
@@ -111,9 +172,6 @@ test('an upgrade renames case-variant agent names before the unique index', asyn
     await setup.query(`INSERT INTO schema_migrations (version) VALUES ($1)`, [
       '001_init.sql',
     ]);
-    const before = await setup.query<{ id: string; name: string }>(
-      'SELECT id, name FROM agents ORDER BY created_at, id',
-    );
 
     await migrate(pool);
     app = buildApp(caseUrl);
@@ -122,9 +180,50 @@ test('an upgrade renames case-variant agent names before the unique index', asyn
       'SELECT id, name FROM agents ORDER BY created_at, id',
     );
     expect(after.rows.map((row) => row.id)).toEqual(
-      before.rows.map((row) => row.id),
+      inserted.rows.map((row) => row.id),
     );
-    expect(after.rows.map((row) => row.name)).toEqual(['Alpha', 'alpha_2']);
+    const renamedLong = `${longRenamed.slice(0, 62)}-2`;
+    expect(after.rows.map((row) => row.name)).toEqual([
+      'Alpha',
+      'alpha-3',
+      'ALPHA-4',
+      'alpha-2',
+      longKeeper,
+      renamedLong,
+    ]);
+    expect(renamedLong).toHaveLength(64);
+    expect(renamedLong).toMatch(/^[A-Za-z0-9][A-Za-z0-9_-]*$/);
+    expect(longKeeper).toHaveLength(64);
+    const hashesAfter = await setup.query<{ id: string; token_hash: Buffer }>(
+      'SELECT id, token_hash FROM agents ORDER BY id',
+    );
+    expect(
+      hashesAfter.rows.map((row) => row.token_hash.toString('hex')),
+    ).toEqual(hashesBefore.rows.map((row) => row.token_hash.toString('hex')));
+    const messagesAfter = await setup.query<{
+      id: string;
+      from_agent: string;
+      to_agent: string;
+      body: string;
+    }>(
+      `SELECT id, from_agent, to_agent, body
+       FROM messages
+       ORDER BY id`,
+    );
+    expect(messagesAfter.rows).toEqual(
+      [...messages.rows].sort((left, right) =>
+        left.id < right.id ? -1 : left.id > right.id ? 1 : 0,
+      ),
+    );
+    const receiptsAfter = await setup.query<{
+      message_id: string;
+      agent_id: string;
+    }>(
+      `SELECT message_id, agent_id
+       FROM message_receipts
+       ORDER BY message_id, agent_id`,
+    );
+    expect(receiptsAfter.rows).toEqual(receiptsBefore.rows);
     const index = await setup.query(
       `SELECT 1
        FROM pg_indexes
@@ -137,6 +236,26 @@ test('an upgrade renames case-variant agent names before the unique index', asyn
     const health = await app.inject({ method: 'GET', url: '/health' });
     expect(health.statusCode).toBe(200);
     expect(health.body).toBe('{"ok":true}');
+    for (const token of [olderToken, newerToken, longRenamedToken]) {
+      const agents = await app.inject({
+        method: 'GET',
+        url: '/agents',
+        headers: { authorization: `Bearer ${token}` },
+      });
+      expect(agents.statusCode).toBe(200);
+    }
+    const listed = await app.inject({
+      method: 'GET',
+      url: '/agents',
+      headers: { authorization: `Bearer ${olderToken}` },
+    });
+    const names = (listed.json() as { agents: { name: string }[] }).agents.map(
+      (agent) => agent.name,
+    );
+    expect(names).toContain('Alpha');
+    expect(names).toContain('alpha-3');
+    expect(names).toContain(renamedLong);
+    expect(names).not.toContain('alpha');
   } finally {
     await app?.close();
     await setup.end().catch(() => undefined);
@@ -148,8 +267,49 @@ test('an upgrade renames case-variant agent names before the unique index', asyn
   }
 });
 
+test('closing the app unblocks a migration waiting on the database', async () => {
+  const holder = new Client({ connectionString: databaseUrl });
+  holder.on('error', () => undefined);
+  await holder.connect();
+  await holder.query('SELECT pg_advisory_lock($1::bigint)', ['185003']);
+  const blocked = buildApp(databaseUrl);
+  try {
+    let waiting = false;
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const found = await holder.query(
+        `SELECT 1
+         FROM pg_stat_activity
+         WHERE pid <> pg_backend_pid()
+           AND query LIKE '%pg_advisory_lock%'
+           AND state = 'active'`,
+      );
+      if ((found.rowCount ?? 0) > 0) {
+        waiting = true;
+        break;
+      }
+      await delay(50);
+    }
+    expect(waiting).toBe(true);
+    const started = Date.now();
+    await blocked.close();
+    expect(Date.now() - started).toBeLessThan(2000);
+  } finally {
+    await blocked.close().catch(() => undefined);
+    await holder
+      .query('SELECT pg_advisory_unlock($1::bigint)', ['185003'])
+      .catch(() => undefined);
+    await holder.end().catch(() => undefined);
+  }
+}, 15_000);
+
 function databaseUrlFor(name: string): string {
   const url = new URL(databaseUrl);
   url.pathname = `/${name}`;
   return url.toString();
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }

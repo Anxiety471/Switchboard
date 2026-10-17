@@ -10,6 +10,15 @@ type TimeoutClient = PoolClient & {
 };
 
 const LOCK_KEY = '185003';
+const MIGRATION_QUERY_TIMEOUT_MS = 5 * 60 * 1000;
+const KEEPALIVE_INITIAL_DELAY_MS = 10_000;
+
+function enableMigrationKeepAlive(client: PoolClient): void {
+  const stream = client.connection.stream as {
+    setKeepAlive?: (enable: boolean, initialDelay?: number) => void;
+  };
+  stream.setKeepAlive?.(true, KEEPALIVE_INITIAL_DELAY_MS);
+}
 
 async function migrationsDirectory(): Promise<string> {
   const here = dirname(fileURLToPath(import.meta.url));
@@ -53,8 +62,10 @@ export async function migrate(pool: Pool, directory?: string): Promise<void> {
     .sort();
   const client = await pool.connect();
   const timed = client as TimeoutClient;
+  enableMigrationKeepAlive(client);
   const queryTimeout = timed.connectionParameters.query_timeout;
-  timed.connectionParameters.query_timeout = false;
+  // node-pg reads connectionParameters.query_timeout; the pg_sleep(3) test guards it.
+  timed.connectionParameters.query_timeout = MIGRATION_QUERY_TIMEOUT_MS;
   let discard: Error | undefined;
   try {
     await client.query('SET statement_timeout = 0');

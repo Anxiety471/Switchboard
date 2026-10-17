@@ -2,6 +2,7 @@ DO $$
 DECLARE
   dup record;
   candidate text;
+  suffix text;
   n integer;
 BEGIN
   FOR dup IN
@@ -22,9 +23,8 @@ BEGIN
   LOOP
     n := 2;
     LOOP
-      candidate := left(dup.name, 64 - char_length('_' || n::text))
-        || '_'
-        || n::text;
+      suffix := '-' || n::text;
+      candidate := left(dup.name, 64 - char_length(suffix)) || suffix;
       EXIT WHEN NOT EXISTS (
         SELECT 1
         FROM agents
