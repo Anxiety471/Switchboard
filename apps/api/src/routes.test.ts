@@ -1569,9 +1569,6 @@ test('GET /messages/search rejects invalid filters', async () => {
     'text=',
     'agent=alpha',
     'cursor=',
-    `text=${'a'.repeat(1025)}`,
-    `text=${'é'.repeat(513)}`,
-    `text=${'é'.repeat(1024)}`,
     'text=%00',
   ];
   for (const query of cases) {
@@ -1582,6 +1579,18 @@ test('GET /messages/search rejects invalid filters', async () => {
     });
     expect(response.statusCode, query).toBe(400);
     expect(response.json()).toEqual({ error: 'invalid request' });
+  }
+  const overCap = ['a'.repeat(1025), 'é'.repeat(513), 'é'.repeat(1024)];
+  for (const text of overCap) {
+    const response = await app.inject({
+      method: 'GET',
+      url: `/messages/search?${new URLSearchParams({ text })}`,
+      headers: bearer(alpha.token),
+    });
+    expect(response.statusCode, String(Buffer.byteLength(text))).toBe(400);
+    expect(response.json()).toEqual({
+      error: `text must be 1 to ${MAX_SEARCH_TEXT_BYTES} bytes and must not contain NUL`,
+    });
   }
   expect((await search(alpha.token, { limit: 100 })).messages).toEqual([]);
 });
@@ -1642,7 +1651,9 @@ test('GET /messages/search accepts 1024-byte text over real HTTP', async () => {
         headers: { authorization: `Bearer ${alpha.token}` },
       });
       expect(response.status).toBe(400);
-      expect(await response.json()).toEqual({ error: 'invalid request' });
+      expect(await response.json()).toEqual({
+        error: `text must be 1 to ${MAX_SEARCH_TEXT_BYTES} bytes and must not contain NUL`,
+      });
     };
     await rejected('a'.repeat(1025));
     const overBytes = 'é'.repeat(513);

@@ -891,11 +891,7 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
             },
             since: { type: 'string', minLength: 1, maxLength: 40 },
             until: { type: 'string', minLength: 1, maxLength: 40 },
-            text: {
-              type: 'string',
-              minLength: 1,
-              maxLength: MAX_SEARCH_TEXT_BYTES,
-            },
+            text: { type: 'string', minLength: 1 },
             box: { type: 'string', enum: ['received', 'sent'] },
             limit: { type: 'string', pattern: '^[1-9][0-9]{0,2}$' },
             cursor: { type: 'string', minLength: 1, maxLength: 128 },
@@ -937,13 +933,19 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
       const until = filterTime(request.query.until);
       const text = request.query.text;
       if (
+        text !== undefined &&
+        Buffer.byteLength(text, 'utf8') > MAX_SEARCH_TEXT_BYTES
+      ) {
+        return reply.code(400).send({
+          error: `text must be 1 to ${MAX_SEARCH_TEXT_BYTES} bytes and must not contain NUL`,
+        });
+      }
+      if (
         limit === undefined ||
         cursor === undefined ||
         since === undefined ||
         until === undefined ||
-        (text !== undefined &&
-          (text.includes('\0') ||
-            Buffer.byteLength(text, 'utf8') > MAX_SEARCH_TEXT_BYTES))
+        (text !== undefined && text.includes('\0'))
       ) {
         return reply.code(400).send({ error: 'invalid request' });
       }
