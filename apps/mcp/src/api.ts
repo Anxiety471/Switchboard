@@ -6,8 +6,8 @@ import type {
   SentMessage,
 } from '@switchboard/shared';
 
-// POST /inbox/read accepts at most 100 ids.
-const READ_BATCH = 100;
+// POST /inbox/read accepts at most 100 ids, so a page is one call or none.
+const MAX_READ = 100;
 const TIMEOUT_MS = 10_000;
 const SAFE_ERRORS = new Set([
   'unauthorized',
@@ -21,11 +21,13 @@ const SAFE_ERRORS = new Set([
 
 export class SwitchboardError extends Error {
   readonly status: number;
+  readonly code: string;
 
-  constructor(status: number, message: string) {
-    super(message);
+  constructor(status: number, code: string, detail?: string) {
+    super(detail ?? code);
     this.name = 'SwitchboardError';
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -73,14 +75,16 @@ export class SwitchboardClient {
   }
 
   listAgents(): Promise<{ agents: AgentSummary[] }> {
-    return this.request('/agents', { method: 'GET' }).then(parseAgents);
+    return this.request('/agents', { method: 'GET' }).then((result) =>
+      parseAgents(result.body),
+    );
   }
 
   sendMessage(input: { to: string; body: string }): Promise<SentMessage> {
     return this.request('/messages', {
       method: 'POST',
       body: { to: input.to, body: input.body },
-    }).then(parseSent);
+    }).then((result) => parseSent(result.body));
   }
 
   async checkInbox(input: InboxQuery): Promise<InboxPage & { read: string[] }> {
@@ -93,27 +97,31 @@ export class SwitchboardClient {
     if (input.after !== undefined) {
       query.after = input.after;
     }
-    const page = parseInbox(
-      await this.request('/inbox', { method: 'GET', query }),
-    );
-    const read = await this.markRead(
-      page.messages.map((message) => message.id),
-    );
-    return { messages: page.messages, next: page.next, read };
-  }
-
-  private async markRead(ids: readonly string[]): Promise<string[]> {
-    const read: string[] = [];
-    for (let index = 0; index < ids.length; index += READ_BATCH) {
-      const receipt = parseRead(
-        await this.request('/inbox/read', {
-          method: 'POST',
-          body: { ids: ids.slice(index, index + READ_BATCH) },
-        }),
-      );
-      read.push(...receipt.read);
+    const fetched = await this.request('/inbox', { method: 'GET', query });
+    const page = parseInbox(fetched.body);
+    const ids = page.messages.map((message) => message.id);
+    if (ids.length === 0) {
+      return { messages: [], next: page.next, read: [] };
     }
-    return read;
+    if (ids.length > MAX_READ) {
+      throw new SwitchboardError(400, 'invalid request');
+    }
+    const marked = await this.request('/inbox/read', {
+      method: 'POST',
+      body: { ids },
+    });
+    const receipt = parseRead(marked.body);
+    const readIds = new Set(receipt.read.map((id) => id.toLowerCase()));
+    return {
+      messages: page.messages.map((message) => {
+        if (message.readAt !== null || !readIds.has(message.id.toLowerCase())) {
+          return message;
+        }
+        return { ...message, readAt: marked.readAt };
+      }),
+      next: page.next,
+      read: receipt.read,
+    };
   }
 
   private async request(
@@ -123,7 +131,7 @@ export class SwitchboardClient {
       query?: Record<string, string>;
       body?: unknown;
     },
-  ): Promise<unknown> {
+  ): Promise<{ body: unknown; readAt: string }> {
     const url = joinUrl(this.url, path);
     if (options.query !== undefined) {
       for (const [key, value] of Object.entries(options.query)) {
@@ -147,7 +155,11 @@ export class SwitchboardClient {
         signal: AbortSignal.timeout(TIMEOUT_MS),
       });
     } catch {
-      throw new SwitchboardError(0, 'request_failed');
+      throw new SwitchboardError(
+        0,
+        'api_unreachable',
+        `The Switchboard API at ${this.url} is not reachable. Do not retry in a loop.`,
+      );
     }
     const text = await response.text();
     let parsed: unknown;
@@ -161,8 +173,18 @@ export class SwitchboardClient {
     if (!response.ok) {
       throw mapApiError(response.status, parsed);
     }
-    return parsed;
+    return { body: parsed, readAt: readAtFrom(response.headers.get('date')) };
   }
+}
+
+function readAtFrom(header: string | null): string {
+  if (header !== null) {
+    const parsed = new Date(header);
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed.toISOString();
+    }
+  }
+  return new Date().toISOString();
 }
 
 function joinUrl(base: string, path: string): URL {

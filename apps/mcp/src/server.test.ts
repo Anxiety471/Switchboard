@@ -16,6 +16,7 @@ type Reply = { status: number; json: unknown };
 
 const TOKEN = 'agent-token-value';
 const CURSOR = '2024-01-01T00:00:00.000Z|00000000-0000-4000-8000-000000000001';
+const READ_AT = '2024-01-01T00:00:00.000Z';
 
 function message(id: string) {
   return {
@@ -36,7 +37,10 @@ async function startMock(
     const recorded = await record(req);
     requests.push(recorded);
     const reply = respond(recorded);
-    res.writeHead(reply.status, { 'content-type': 'application/json' });
+    res.writeHead(reply.status, {
+      'content-type': 'application/json',
+      date: 'Mon, 01 Jan 2024 00:00:00 GMT',
+    });
     res.end(JSON.stringify(reply.json));
   });
   await new Promise<void>((resolve) => {
@@ -198,6 +202,8 @@ test('rejects invalid tool input before calling the API', async () => {
       ['send_message', { to: 'beta', body: 'bad\0byte' }],
       ['check_inbox', { unread: 'true' }],
       ['check_inbox', { limit: 0 }],
+      ['check_inbox', { limit: 101 }],
+      ['check_inbox', { limit: 200 }],
       ['check_inbox', { limit: 201 }],
       ['check_inbox', { limit: 1.5 }],
       ['check_inbox', { limit: '2' }],
@@ -320,9 +326,10 @@ test('maps an unreachable API and a non-JSON 503 without the token', async () =>
   try {
     const result = await callTool(down.client, 'list_agents');
     expect(result.isError).toBe(true);
-    expect(apiError(result.text)).toEqual({
-      error: 'request_failed',
-      status: 0,
+    expect(JSON.parse(result.text)).toEqual({
+      error: 'api_unreachable',
+      message:
+        'The Switchboard API at http://127.0.0.1:1 is not reachable. Do not retry in a loop.',
     });
     expect(result.text).not.toContain(TOKEN);
   } finally {
@@ -363,15 +370,9 @@ test('maps an unreachable API and a non-JSON 503 without the token', async () =>
   }
 });
 
-test('check_inbox pages, marks the page read, and batches ids', async () => {
-  const ids = Array.from({ length: 101 }, (_value, index) => {
-    return `00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}`;
-  });
-  const first = ids[0];
-  const second = ids[1];
-  if (first === undefined || second === undefined) {
-    throw new Error('expected ids');
-  }
+test('check_inbox pages with one mark-read call and a fresh readAt', async () => {
+  const first = '00000000-0000-4000-8000-000000000001';
+  const second = '00000000-0000-4000-8000-000000000002';
   let inboxCalls = 0;
   const mock = await startMock((request) => {
     if (request.pathname === '/inbox') {
@@ -384,11 +385,10 @@ test('check_inbox pages, marks the page read, and batches ids', async () => {
       }
       return {
         status: 200,
-        json: { messages: ids.map(message), next: null },
+        json: { messages: [message(second)], next: null },
       };
     }
-    const body = request.body;
-    const batch = isIdBatch(body) ? body.ids : [];
+    const batch = isIdBatch(request.body) ? request.body.ids : [];
     return { status: 200, json: { read: batch } };
   });
   const session = await connect(mock.url);
@@ -396,23 +396,25 @@ test('check_inbox pages, marks the page read, and batches ids', async () => {
     const page = await callTool(session.client, 'check_inbox', { limit: 1 });
     expect(page.isError).toBe(false);
     expect(page.value).toEqual({
-      messages: [message(first)],
+      messages: [{ ...message(first), readAt: READ_AT }],
       next: CURSOR,
       read: [first],
     });
     const rest = await callTool(session.client, 'check_inbox', {
       unread: false,
-      limit: 200,
+      limit: 100,
       after: CURSOR,
     });
     expect(rest.isError).toBe(false);
-    const parsed = rest.value as { read?: string[] };
-    expect(parsed.read).toEqual(ids);
+    expect(rest.value).toEqual({
+      messages: [{ ...message(second), readAt: READ_AT }],
+      next: null,
+      read: [second],
+    });
     expect(mock.requests.map((request) => request.pathname)).toEqual([
       '/inbox',
       '/inbox/read',
       '/inbox',
-      '/inbox/read',
       '/inbox/read',
     ]);
     const firstQuery = new URLSearchParams(mock.requests[0]?.search);
@@ -420,14 +422,14 @@ test('check_inbox pages, marks the page read, and batches ids', async () => {
     expect(firstQuery.get('limit')).toBe('1');
     const secondQuery = new URLSearchParams(mock.requests[2]?.search);
     expect(secondQuery.get('unread')).toBe('false');
-    expect(secondQuery.get('limit')).toBe('200');
+    expect(secondQuery.get('limit')).toBe('100');
     expect(secondQuery.get('after')).toBe(CURSOR);
     const batches = mock.requests
       .filter((request) => request.pathname === '/inbox/read')
       .map((request) =>
         isIdBatch(request.body) ? request.body.ids.length : 0,
       );
-    expect(batches).toEqual([1, 100, 1]);
+    expect(batches).toEqual([1, 1]);
   } finally {
     await session.close();
     await mock.close();
@@ -488,26 +490,77 @@ test('list_agents returns agent fields and drops anything else', async () => {
   }
 });
 
-test('a mark-read failure is returned after the inbox was fetched', async () => {
+test('a failed mark-read marks nothing and the message is still there', async () => {
+  const id = '00000000-0000-4000-8000-000000000001';
+  let markFailed = false;
   const mock = await startMock((request) => {
-    if (request.pathname === '/inbox') {
-      return {
-        status: 200,
-        json: {
-          messages: [message('00000000-0000-4000-8000-000000000001')],
-          next: null,
-        },
-      };
+    if (request.pathname === '/inbox/read') {
+      if (!markFailed) {
+        markFailed = true;
+        return { status: 503, json: { error: 'database_unavailable' } };
+      }
+      const ids = isIdBatch(request.body) ? request.body.ids : [];
+      return { status: 200, json: { read: ids } };
     }
-    return { status: 503, json: { error: 'database_unavailable' } };
+    return {
+      status: 200,
+      json: { messages: [message(id)], next: null },
+    };
   });
   const session = await connect(mock.url);
   try {
-    const result = await callTool(session.client, 'check_inbox');
-    expect(apiError(result.text)).toEqual({
+    const failed = await callTool(session.client, 'check_inbox');
+    expect(failed.isError).toBe(true);
+    expect(apiError(failed.text)).toEqual({
       error: 'database_unavailable',
       status: 503,
     });
+    expect(failed.text).not.toContain(id);
+    expect(
+      mock.requests.filter((request) => request.pathname === '/inbox/read'),
+    ).toHaveLength(1);
+
+    const recovered = await callTool(session.client, 'check_inbox');
+    expect(recovered.isError).toBe(false);
+    expect(recovered.value).toEqual({
+      messages: [{ ...message(id), readAt: READ_AT }],
+      next: null,
+      read: [id],
+    });
+    const reads = mock.requests.filter(
+      (request) => request.pathname === '/inbox/read',
+    );
+    expect(reads).toHaveLength(2);
+    expect(reads.map((request) => request.body)).toEqual([
+      { ids: [id] },
+      { ids: [id] },
+    ]);
+  } finally {
+    await session.close();
+    await mock.close();
+  }
+});
+
+test('an inbox page over 100 messages is not partially marked', async () => {
+  const ids = Array.from({ length: 101 }, (_value, index) => {
+    return `00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}`;
+  });
+  const mock = await startMock(() => ({
+    status: 200,
+    json: { messages: ids.map(message), next: null },
+  }));
+  const session = await connect(mock.url);
+  try {
+    const result = await callTool(session.client, 'check_inbox', {
+      limit: 100,
+    });
+    expect(apiError(result.text)).toEqual({
+      error: 'invalid request',
+      status: 400,
+    });
+    expect(mock.requests.map((request) => request.pathname)).toEqual([
+      '/inbox',
+    ]);
   } finally {
     await session.close();
     await mock.close();

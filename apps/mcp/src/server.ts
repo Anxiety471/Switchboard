@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { SwitchboardClient, SwitchboardError } from './api.js';
 import type { SwitchboardClientOptions } from './api.js';
 
+// Client-side checks give friendlier errors and mirror the API limits.
 const RECIPIENT = /^(?:\*|[A-Za-z0-9][A-Za-z0-9_-]{0,63})$/;
 const MAX_BODY_BYTES = 8192;
 const CURSOR =
@@ -44,15 +45,29 @@ function jsonResult(data: object) {
 }
 
 function toolFailure(error: unknown) {
+  if (error instanceof SwitchboardError && error.code === 'api_unreachable') {
+    return {
+      isError: true as const,
+      content: [
+        {
+          type: 'text' as const,
+          text: JSON.stringify({
+            error: error.code,
+            message: error.message,
+          }),
+        },
+      ],
+    };
+  }
   const status = error instanceof SwitchboardError ? error.status : 0;
-  const message =
-    error instanceof SwitchboardError ? error.message : 'request_failed';
+  const code =
+    error instanceof SwitchboardError ? error.code : 'request_failed';
   return {
     isError: true as const,
     content: [
       {
         type: 'text' as const,
-        text: JSON.stringify({ error: message, status }),
+        text: JSON.stringify({ error: code, status }),
       },
     ],
   };
@@ -124,9 +139,9 @@ export function createMcpServer(options: SwitchboardClientOptions): McpServer {
           .number()
           .int()
           .min(1)
-          .max(200)
+          .max(100)
           .optional()
-          .describe('Page size from 1 to 200'),
+          .describe('Page size from 1 to 100'),
         after: z
           .string()
           .refine(validCursor, 'invalid cursor')

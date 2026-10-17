@@ -112,7 +112,9 @@ test('two agents exchange direct and broadcast messages through the tools', asyn
           from: 'alpha',
           to: 'beta',
           body: 'hello beta',
-          readAt: null,
+          readAt: expect.stringMatching(
+            /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
+          ),
         },
       ],
       next: null,
