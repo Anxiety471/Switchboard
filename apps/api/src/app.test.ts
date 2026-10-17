@@ -39,8 +39,16 @@ test('GET /health queries postgres', async () => {
 });
 
 test('GET /health returns 503 when postgres is unreachable', async () => {
+  const logs: string[] = [];
   const down = buildApp(
     'postgres://switchboard_user:s3cret-pass@127.0.0.1:1/unreachable_test',
+    {
+      logStream: {
+        write(message) {
+          logs.push(message);
+        },
+      },
+    },
   );
 
   try {
@@ -77,6 +85,12 @@ test('GET /health returns 503 when postgres is unreachable', async () => {
     expect(registeredBody).not.toMatch(
       /ECONNREFUSED|switchboard_user|s3cret-pass|unreachable_test/,
     );
+    const unavailable = logs.filter((line) =>
+      line.includes('database unavailable'),
+    );
+    expect(
+      unavailable.some((line) => line.includes('"code":"ECONNREFUSED"')),
+    ).toBe(true);
   } finally {
     await down.close();
   }
@@ -235,6 +249,77 @@ test('GET /health survives pg_terminate_backend', async () => {
     await proxy.close();
   }
 });
+
+test('GET /agents returns 503 while agents is exclusively locked', async () => {
+  const logs: string[] = [];
+  const lockedApp = buildApp(databaseUrl, {
+    logStream: {
+      write(message) {
+        logs.push(message);
+      },
+    },
+  });
+  const locker = new Client({ connectionString: databaseUrl });
+  try {
+    await lockedApp.migrationsReady;
+    await locker.connect();
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      await locker.query('BEGIN');
+      await locker.query('LOCK TABLE agents IN ACCESS EXCLUSIVE MODE');
+      const lockedAt = Date.now();
+      const pending = lockedApp.inject({
+        method: 'GET',
+        url: '/agents',
+        headers: { authorization: 'Bearer not-a-real-token' },
+      });
+      const responsePromise = pending.then((response) => ({
+        kind: 'response' as const,
+        response,
+      }));
+      try {
+        const outcome = await Promise.race([
+          responsePromise,
+          delay(2400).then(() => ({ kind: 'hung' as const })),
+        ]);
+        const elapsed = Date.now() - lockedAt;
+        if (outcome.kind === 'hung') {
+          void responsePromise.catch(() => undefined);
+          throw new Error(
+            `GET /agents did not return within 2.4s (attempt ${attempt}, ${elapsed}ms)`,
+          );
+        }
+        expect(elapsed).toBeLessThan(2400);
+        expect(outcome.response.statusCode).toBe(503);
+        expect(outcome.response.body).toBe('{"error":"database_unavailable"}');
+      } finally {
+        await locker.query('ROLLBACK');
+      }
+    }
+
+    const recovered = await lockedApp.inject({
+      method: 'GET',
+      url: '/agents',
+      headers: { authorization: 'Bearer not-a-real-token' },
+    });
+    expect(recovered.statusCode).toBe(401);
+    expect(recovered.body).toBe('{"error":"unauthorized"}');
+    const authFailures = logs.filter(
+      (line) =>
+        line.includes('database auth check failed') &&
+        line.includes('"code":"57014"'),
+    );
+    expect(authFailures).toHaveLength(5);
+  } finally {
+    await locker.end().catch(() => undefined);
+    await lockedApp.close();
+  }
+}, 40_000);
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
 
 function freePort(): Promise<number> {
   const server = createServer();

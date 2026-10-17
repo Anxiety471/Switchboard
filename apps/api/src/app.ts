@@ -1,6 +1,6 @@
 import type { IncomingHttpHeaders } from 'node:http';
 import Fastify, { type FastifyError } from 'fastify';
-import { Pool } from 'pg';
+import { Pool, type PoolClient } from 'pg';
 import type {
   AgentSummary,
   InboxMessage,
@@ -20,7 +20,10 @@ const MAX_INBOX_LIMIT = 200;
 const ONLINE_INTERVAL = '60 seconds';
 const MIGRATION_RETRY_MIN_MS = 200;
 const MIGRATION_RETRY_MAX_MS = 5000;
-const DATABASE_TIMEOUT_MS = 2000;
+const CONNECTION_TIMEOUT_MS = 2000;
+const STATEMENT_TIMEOUT_MS = 2000;
+const QUERY_TIMEOUT_MS = 2500;
+const KEEPALIVE_INITIAL_DELAY_MS = 10_000;
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const UUID_PATTERN =
   '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';
@@ -49,6 +52,7 @@ const CONNECTION_ERRORS = new Set([
   '08003',
   '08004',
   '08006',
+  '57014',
   '57P01',
   '57P02',
   '57P03',
@@ -241,24 +245,30 @@ function parseCursor(
   return { createdAt, id };
 }
 
-function isDatabaseUnavailable(error: unknown): boolean {
+function unavailableMessage(error: object): boolean {
+  if (!('message' in error) || typeof error.message !== 'string') {
+    return false;
+  }
+  const message = error.message.toLowerCase();
+  return UNAVAILABLE_MESSAGES.some((part) => message.includes(part));
+}
+
+export function isDatabaseUnavailable(error: unknown): boolean {
   if (typeof error !== 'object' || error === null) {
     return false;
   }
-  if ('code' in error) {
-    const code = error.code;
-    if (typeof code === 'string' && CONNECTION_ERRORS.has(code)) {
+  const code = pgField(error, 'code');
+  if (code !== undefined) {
+    if (CONNECTION_ERRORS.has(code)) {
       return true;
     }
-  }
-  if ('message' in error && typeof error.message === 'string') {
-    const message = error.message.toLowerCase();
-    if (UNAVAILABLE_MESSAGES.some((part) => message.includes(part))) {
-      return true;
-    }
+  } else if (unavailableMessage(error)) {
+    return true;
   }
   if ('errors' in error && Array.isArray(error.errors)) {
-    return error.errors.some((item) => isDatabaseUnavailable(item));
+    if (error.errors.some((item) => isDatabaseUnavailable(item))) {
+      return true;
+    }
   }
   if ('cause' in error && error.cause !== undefined && error.cause !== error) {
     return isDatabaseUnavailable(error.cause);
@@ -270,6 +280,14 @@ function databaseUnavailableBody(): { error: 'database_unavailable' } {
   return { error: 'database_unavailable' };
 }
 
+function unavailableLog(error: unknown): { err: unknown; code?: string } {
+  const code = pgField(error, 'code');
+  if (code === undefined) {
+    return { err: error };
+  }
+  return { err: error, code };
+}
+
 function registrationHeader(headers: IncomingHttpHeaders): string {
   const header = headers['x-registration-secret'];
   return typeof header === 'string' ? header : '';
@@ -278,9 +296,11 @@ function registrationHeader(headers: IncomingHttpHeaders): string {
 export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
   const pool = new Pool({
     connectionString: databaseUrl,
-    connectionTimeoutMillis: DATABASE_TIMEOUT_MS,
-    query_timeout: DATABASE_TIMEOUT_MS,
-    statement_timeout: DATABASE_TIMEOUT_MS,
+    connectionTimeoutMillis: CONNECTION_TIMEOUT_MS,
+    query_timeout: QUERY_TIMEOUT_MS,
+    statement_timeout: STATEMENT_TIMEOUT_MS,
+    keepAlive: true,
+    keepAliveInitialDelayMillis: KEEPALIVE_INITIAL_DELAY_MS,
     max: options?.max ?? 10,
   });
   const logging = options?.logger === true || options?.logStream !== undefined;
@@ -288,6 +308,13 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
   let migrated = options?.migrate === false;
   let migrationStopped = false;
   let wake: (() => void) | undefined;
+  const checkedOut = new Set<PoolClient>();
+  pool.on('acquire', (client) => {
+    checkedOut.add(client);
+  });
+  pool.on('release', (_error, client) => {
+    checkedOut.delete(client);
+  });
   let resolveReady: () => void = () => {};
   const migrationsReady = new Promise<void>((resolve) => {
     resolveReady = resolve;
@@ -370,7 +397,7 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
         resolveReady();
         return;
       } catch (error) {
-        app.log.error({ err: error }, 'migration failed; retrying');
+        app.log.error(unavailableLog(error), 'migration failed; retrying');
       }
       if (migrationStopped) {
         return;
@@ -384,7 +411,7 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
 
   app.setErrorHandler((error, _request, reply) => {
     if (isDatabaseUnavailable(error)) {
-      app.log.error({ err: error }, 'database unavailable');
+      app.log.error(unavailableLog(error), 'database unavailable');
       return reply.code(503).send(databaseUnavailableBody());
     }
     const statusCode = statusCodeOf(error);
@@ -440,7 +467,7 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
       );
     } catch (error) {
       if (isDatabaseUnavailable(error)) {
-        app.log.error({ err: error }, 'database auth check failed');
+        app.log.error(unavailableLog(error), 'database auth check failed');
         return reply.code(503).send(databaseUnavailableBody());
       }
       throw error;
@@ -460,7 +487,7 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
       await pool.query('SELECT 1 AS ok');
       return { ok: true };
     } catch (error) {
-      app.log.error({ err: error }, 'database health check failed');
+      app.log.error(unavailableLog(error), 'database health check failed');
       return reply.code(503).send({ ok: false });
     }
   });
@@ -527,7 +554,7 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
           return reply.code(409).send({ error: 'name already registered' });
         }
         if (isDatabaseUnavailable(error)) {
-          app.log.error({ err: error }, 'database unavailable');
+          app.log.error(unavailableLog(error), 'database unavailable');
           return reply.code(503).send(databaseUnavailableBody());
         }
         throw error;
@@ -839,6 +866,13 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
   app.addHook('onClose', async () => {
     migrationStopped = true;
     wake?.();
+    const active = [...checkedOut];
+    await Promise.all(
+      active.map(async (client) => {
+        client.on('error', () => undefined);
+        await client.end();
+      }),
+    );
     await migrationTask;
     await pool.end();
   });
