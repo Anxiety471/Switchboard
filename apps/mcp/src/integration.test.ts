@@ -1,5 +1,9 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { access } from 'node:fs/promises';
+import {
+  createServer as createHttpServer,
+  request as httpRequest,
+} from 'node:http';
 import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -98,51 +102,67 @@ test('two agents exchange direct and broadcast messages through the tools', asyn
     });
     expect(listed.text).not.toContain(alpha.token);
 
+    const directBody = 'hello beta, this is the full message body';
     const sent = await callTool(alphaSession.client, 'send_message', {
       to: 'Beta',
-      body: 'hello beta',
+      body: directBody,
     });
     expect(sent.isError).toBe(false);
     const sentId = idOf(sent.value);
     const inbox = await callTool(betaSession.client, 'check_inbox');
+    expect(inbox.isError).toBe(false);
+    expect(inbox.text).toContain(directBody);
+    const storedRead = await database().query<{ read_at: Date }>(
+      `SELECT read_at
+       FROM message_receipts
+       WHERE message_id = $1 AND agent_id = $2`,
+      [sentId, beta.id],
+    );
+    const storedReadAt = storedRead.rows[0]?.read_at.toISOString();
+    if (storedReadAt === undefined) {
+      throw new Error('expected a receipt');
+    }
     expect(inbox.value).toMatchObject({
       messages: [
         {
           id: sentId,
           from: 'alpha',
           to: 'beta',
-          body: 'hello beta',
-          readAt: expect.stringMatching(
-            /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
-          ),
+          body: directBody,
+          readAt: storedReadAt,
         },
       ],
       next: null,
       read: [sentId],
     });
+    const visible = messageOf(inbox.value);
+    expect(Date.parse(visible.readAt)).toBeGreaterThanOrEqual(
+      Date.parse(visible.createdAt),
+    );
     expect(await callTool(betaSession.client, 'check_inbox')).toMatchObject({
       isError: false,
       value: { messages: [], next: null, read: [] },
     });
     expect(await unreadIds(beta.token)).toEqual([]);
 
+    const broadcastBody = 'hello all, this is the full broadcast body';
     const broadcast = await callTool(alphaSession.client, 'send_message', {
       to: '*',
-      body: 'hello all',
+      body: broadcastBody,
     });
     const broadcastId = idOf(broadcast.value);
-    expect(
-      (await callTool(betaSession.client, 'check_inbox')).value,
-    ).toMatchObject({
+    const betaBroadcast = await callTool(betaSession.client, 'check_inbox');
+    expect(betaBroadcast.text).toContain(broadcastBody);
+    expect(betaBroadcast.value).toMatchObject({
       messages: [
-        { id: broadcastId, from: 'alpha', to: '*', body: 'hello all' },
+        { id: broadcastId, from: 'alpha', to: '*', body: broadcastBody },
       ],
       read: [broadcastId],
     });
-    expect(
-      (await callTool(gammaSession.client, 'check_inbox')).value,
-    ).toMatchObject({
-      messages: [{ id: broadcastId, to: '*' }],
+    const gammaBroadcast = await callTool(gammaSession.client, 'check_inbox');
+    expect(gammaBroadcast.text).toContain(broadcastBody);
+    expect(gammaBroadcast.value).toMatchObject({
+      messages: [{ id: broadcastId, to: '*', body: broadcastBody }],
       read: [broadcastId],
     });
     expect(await callTool(alphaSession.client, 'check_inbox')).toMatchObject({
@@ -197,6 +217,7 @@ test('check_inbox follows the API cursor and marks each page read', async () => 
     await callTool(sender.client, 'send_message', { to: 'alpha', body: 'one' });
     await callTool(sender.client, 'send_message', { to: 'alpha', body: 'two' });
     const first = await callTool(reader.client, 'check_inbox', { limit: 1 });
+    expect(first.text).toContain('one');
     const page = first.value as {
       messages: { body: string; id: string }[];
       next: string;
@@ -209,6 +230,7 @@ test('check_inbox follows the API cursor and marks each page read', async () => 
       limit: 1,
       after: page.next,
     });
+    expect(second.text).toContain('two');
     expect(second.value).toMatchObject({
       messages: [{ body: 'two' }],
       next: null,
@@ -222,8 +244,116 @@ test('check_inbox follows the API cursor and marks each page read', async () => 
   }
 });
 
-async function connect(token: string) {
-  const server = createMcpServer({ url: apiUrl, token });
+test('check_inbox returns the page when mark-read commits and the response is dropped', async () => {
+  const alpha = await register('alpha');
+  const beta = await register('beta');
+  const body = `committed then dropped ${'m'.repeat(120)} end`;
+  const sender = await connect(alpha.token);
+  let sent: ToolResult;
+  try {
+    sent = await callTool(sender.client, 'send_message', {
+      to: 'beta',
+      body,
+    });
+  } finally {
+    await sender.close();
+  }
+  const sentId = idOf(sent.value);
+  const proxy = await startMarkReadProxy(apiUrl, 'drop-after-commit');
+  const reader = await connect(beta.token, proxy.url);
+  try {
+    const inbox = await callTool(reader.client, 'check_inbox');
+    expect(inbox.isError).toBe(false);
+    expect(inbox.text).toContain(body);
+    expect(inbox.text).toContain(
+      'Mark-read could not be confirmed. These messages may show again.',
+    );
+    expect(inbox.text).not.toContain(beta.token);
+    expect(inbox.value).toMatchObject({
+      messages: [{ id: sentId, from: 'alpha', to: 'beta', body, readAt: null }],
+      read: [],
+    });
+    expect(proxy.markReadAttempts()).toBe(2);
+    expect(proxy.forwardedMarkReads()).toBe(2);
+    const stored = await database().query<{ read_at: Date | null }>(
+      `SELECT read_at
+       FROM message_receipts
+       WHERE message_id = $1 AND agent_id = $2`,
+      [sentId, beta.id],
+    );
+    expect(stored.rows[0]?.read_at).not.toBeNull();
+  } finally {
+    await reader.close();
+    await proxy.close();
+  }
+  const again = await connect(beta.token);
+  try {
+    const reread = await callTool(again.client, 'check_inbox');
+    expect(reread.text).not.toContain(body);
+    expect(reread.value).toMatchObject({ messages: [], read: [] });
+  } finally {
+    await again.close();
+  }
+});
+
+test('check_inbox returns the page when mark-read fails before it commits', async () => {
+  const alpha = await register('alpha');
+  const beta = await register('beta');
+  const body = `failed before commit ${'n'.repeat(120)} end`;
+  const sender = await connect(alpha.token);
+  let sent: ToolResult;
+  try {
+    sent = await callTool(sender.client, 'send_message', {
+      to: 'beta',
+      body,
+    });
+  } finally {
+    await sender.close();
+  }
+  const sentId = idOf(sent.value);
+  const proxy = await startMarkReadProxy(apiUrl, 'fail-before-commit');
+  const reader = await connect(beta.token, proxy.url);
+  try {
+    const inbox = await callTool(reader.client, 'check_inbox');
+    expect(inbox.isError).toBe(false);
+    expect(inbox.text).toContain(body);
+    expect(inbox.text).toContain(
+      'Mark-read could not be confirmed. These messages may show again.',
+    );
+    expect(inbox.text).not.toContain(beta.token);
+    expect(inbox.value).toMatchObject({
+      messages: [{ id: sentId, body, readAt: null }],
+      read: [],
+    });
+    expect(proxy.markReadAttempts()).toBe(2);
+    expect(proxy.forwardedMarkReads()).toBe(0);
+    const stored = await database().query<{ read_at: Date | null }>(
+      `SELECT read_at
+       FROM message_receipts
+       WHERE message_id = $1 AND agent_id = $2`,
+      [sentId, beta.id],
+    );
+    expect(stored.rows[0]?.read_at).toBeNull();
+  } finally {
+    await reader.close();
+    await proxy.close();
+  }
+  const again = await connect(beta.token);
+  try {
+    const reread = await callTool(again.client, 'check_inbox');
+    expect(reread.isError).toBe(false);
+    expect(reread.text).toContain(body);
+    expect(reread.value).toMatchObject({
+      messages: [{ id: sentId, body }],
+      read: [sentId],
+    });
+  } finally {
+    await again.close();
+  }
+});
+
+async function connect(token: string, url = apiUrl) {
+  const server = createMcpServer({ url, token });
   const client = new Client({ name: 'test', version: '0.0.0' });
   const [clientTransport, serverTransport] =
     InMemoryTransport.createLinkedPair();
@@ -325,6 +455,149 @@ async function unreadIds(token: string): Promise<string[]> {
       return [message.id];
     }
     return [];
+  });
+}
+
+function messageOf(value: unknown): { createdAt: string; readAt: string } {
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    !('messages' in value) ||
+    !Array.isArray(value.messages)
+  ) {
+    throw new Error('expected inbox messages');
+  }
+  const message: unknown = value.messages[0];
+  if (
+    typeof message !== 'object' ||
+    message === null ||
+    !('createdAt' in message) ||
+    typeof message.createdAt !== 'string' ||
+    !('readAt' in message) ||
+    typeof message.readAt !== 'string'
+  ) {
+    throw new Error('expected a message timestamp');
+  }
+  return { createdAt: message.createdAt, readAt: message.readAt };
+}
+
+function database(): PgClient {
+  if (admin === undefined) {
+    throw new Error('database is not connected');
+  }
+  return admin;
+}
+
+type MarkReadFault = 'drop-after-commit' | 'fail-before-commit';
+
+function startMarkReadProxy(
+  upstreamUrl: string,
+  fault: MarkReadFault,
+): Promise<{
+  url: string;
+  markReadAttempts: () => number;
+  forwardedMarkReads: () => number;
+  close: () => Promise<void>;
+}> {
+  const upstream = new URL(upstreamUrl);
+  let attempts = 0;
+  let forwarded = 0;
+  const server = createHttpServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => {
+      chunks.push(chunk);
+    });
+    req.on('error', () => {
+      if (!req.socket.destroyed) {
+        req.socket.destroy();
+      }
+    });
+    req.on('end', () => {
+      const path = req.url ?? '/';
+      const pathname = path.split('?')[0] ?? path;
+      const markRead = req.method === 'POST' && pathname === '/inbox/read';
+      if (markRead) {
+        attempts += 1;
+        if (fault === 'fail-before-commit') {
+          res.writeHead(502, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'bad gateway' }));
+          return;
+        }
+      }
+      const body = Buffer.concat(chunks);
+      const headers: Record<string, string | string[] | undefined> = {
+        ...req.headers,
+        host: upstream.host,
+        'content-length': String(body.length),
+      };
+      delete headers.connection;
+      delete headers['transfer-encoding'];
+      const upstreamReq = httpRequest(
+        {
+          protocol: upstream.protocol,
+          hostname: upstream.hostname,
+          port: upstream.port,
+          method: req.method,
+          path,
+          headers,
+        },
+        (upstreamRes) => {
+          if (markRead && fault === 'drop-after-commit') {
+            upstreamRes.resume();
+            upstreamRes.on('end', () => {
+              forwarded += 1;
+              if (!req.socket.destroyed) {
+                req.socket.destroy();
+              }
+            });
+            upstreamRes.on('error', () => {
+              if (!req.socket.destroyed) {
+                req.socket.destroy();
+              }
+            });
+            return;
+          }
+          res.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers);
+          upstreamRes.pipe(res);
+        },
+      );
+      upstreamReq.on('error', () => {
+        if (!res.headersSent) {
+          res.writeHead(502);
+          res.end();
+          return;
+        }
+        if (!req.socket.destroyed) {
+          req.socket.destroy();
+        }
+      });
+      upstreamReq.end(body);
+    });
+  });
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      if (address === null || typeof address === 'string') {
+        reject(new Error('proxy failed to bind'));
+        return;
+      }
+      resolve({
+        url: `http://127.0.0.1:${address.port}`,
+        markReadAttempts: () => attempts,
+        forwardedMarkReads: () => forwarded,
+        close: () =>
+          new Promise((resolveClose, rejectClose) => {
+            server.close((error) => {
+              if (error) {
+                rejectClose(error);
+                return;
+              }
+              resolveClose();
+            });
+          }),
+      });
+    });
   });
 }
 

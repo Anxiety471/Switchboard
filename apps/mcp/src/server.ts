@@ -79,7 +79,7 @@ export function createMcpServer(options: SwitchboardClientOptions): McpServer {
     { name: 'switchboard', version: '0.0.0' },
     {
       instructions:
-        'Switchboard tools use the agent token in this process. list_agents shows registered agents, send_message sends to one agent or broadcasts with *, and check_inbox reads this inbox and marks the returned page read.',
+        'Switchboard tools use the agent token in this process. list_agents shows registered agents, send_message sends to one agent or broadcasts with *, and check_inbox reads this inbox and marks the returned page read. If mark-read cannot be confirmed, check_inbox still returns that page with a warning.',
     },
   );
 
@@ -129,7 +129,7 @@ export function createMcpServer(options: SwitchboardClientOptions): McpServer {
     {
       title: 'Check inbox',
       description:
-        'Read this inbox, oldest first. Defaults to unread messages and marks the returned page as read. Pass next as after to read another page.',
+        'Read this inbox, oldest first. Defaults to unread messages and marks the returned page as read. Pass next as after to read another page. If mark-read cannot be confirmed, the page is still returned with a warning and messages may show again.',
       inputSchema: {
         unread: z
           .boolean()
@@ -160,6 +160,7 @@ export function createMcpServer(options: SwitchboardClientOptions): McpServer {
           messages: page.messages,
           next: page.next,
           read: page.read,
+          ...(page.warning !== undefined ? { warning: page.warning } : {}),
         });
       } catch (error) {
         return toolFailure(error);

@@ -1,5 +1,5 @@
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { readConfig, type SwitchboardConfig } from './config.js';
+import { ConfigError, readConfig, type SwitchboardConfig } from './config.js';
 import { createMcpServer } from './server.js';
 
 const server = createMcpServer(loadConfig());
@@ -9,10 +9,7 @@ function loadConfig(): SwitchboardConfig {
   try {
     return readConfig(process.env);
   } catch (error) {
-    if (
-      error instanceof Error &&
-      error.message === 'SWITCHBOARD_TOKEN is required'
-    ) {
+    if (error instanceof ConfigError) {
       console.error(error.message);
       process.exit(1);
     }

@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest';
-import { readConfig } from './config.js';
+import { ConfigError, readConfig } from './config.js';
 
 const token = 'a'.repeat(43);
 
@@ -45,8 +45,10 @@ test('readConfig rejects URLs and tokens it would not send', () => {
       SWITCHBOARD_TOKEN: secret,
     });
   } catch (error) {
-    expect(error).toBeInstanceOf(Error);
-    expect(error instanceof Error ? error.message : '').not.toContain(secret);
+    expect(error).toBeInstanceOf(ConfigError);
+    expect(error instanceof ConfigError ? error.message : '').not.toContain(
+      secret,
+    );
   }
   expect(() =>
     readConfig({

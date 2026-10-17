@@ -576,6 +576,121 @@ test('direct messages are oldest-first and visible only to the recipient', async
   expect(untouched.rows[0]?.read_at).toBeNull();
 });
 
+test('POST /inbox/read returns each stored read_at', async () => {
+  const alpha = await register('alpha');
+  const beta = await register('beta');
+  const older = await send(beta.token, { to: 'alpha', body: 'older' });
+  const newer = await send(beta.token, { to: 'alpha', body: 'newer' });
+  await admin.query(
+    `UPDATE message_receipts
+     SET read_at = $3::timestamptz
+     WHERE message_id = $1 AND agent_id = $2`,
+    [older.id, alpha.id, '2020-05-01T00:00:00.123Z'],
+  );
+  const preset = await admin.query<{ read_at: Date }>(
+    `SELECT read_at
+     FROM message_receipts
+     WHERE message_id = $1 AND agent_id = $2`,
+    [older.id, alpha.id],
+  );
+  const presetReadAt = preset.rows[0]?.read_at.toISOString();
+  expect(presetReadAt).toBe('2020-05-01T00:00:00.123Z');
+
+  const receipt = await markRead(alpha.token, [newer.id, older.id]);
+  const stored = await admin.query<{
+    message_id: string;
+    read_at: Date;
+    created_at: Date;
+  }>(
+    `SELECT r.message_id, r.read_at, m.created_at
+     FROM message_receipts r
+     JOIN messages m ON m.id = r.message_id
+     WHERE r.agent_id = $1`,
+    [alpha.id],
+  );
+  const byId = new Map(
+    stored.rows.map((row) => [
+      row.message_id,
+      { readAt: row.read_at.toISOString(), createdAt: row.created_at },
+    ]),
+  );
+  const newerStored = byId.get(newer.id);
+  const olderStored = byId.get(older.id);
+  if (
+    newerStored === undefined ||
+    olderStored === undefined ||
+    presetReadAt === undefined
+  ) {
+    throw new Error('expected stored receipts');
+  }
+  expect(olderStored.readAt).toBe(presetReadAt);
+  expect(receipt).toEqual({
+    read: [newer.id, older.id],
+    marked: [
+      { id: newer.id, readAt: newerStored.readAt },
+      { id: older.id, readAt: presetReadAt },
+    ],
+  });
+  expect(Date.parse(newerStored.readAt)).toBeGreaterThanOrEqual(
+    newerStored.createdAt.getTime(),
+  );
+  expect(newerStored.readAt).not.toBe(presetReadAt);
+
+  const again = await markRead(alpha.token, [older.id, newer.id]);
+  expect(again).toEqual({
+    read: [older.id, newer.id],
+    marked: [
+      { id: older.id, readAt: presetReadAt },
+      { id: newer.id, readAt: newerStored.readAt },
+    ],
+  });
+});
+
+test('POST /inbox/read returns null readAt when the stored value is null', async () => {
+  const alpha = await register('alpha');
+  const beta = await register('beta');
+  const sent = await send(beta.token, { to: 'alpha', body: 'null read' });
+  await admin.query(
+    'DROP TRIGGER IF EXISTS switchboard_null_read_at ON message_receipts',
+  );
+  await admin.query('DROP FUNCTION IF EXISTS switchboard_null_read_at()');
+  await admin.query(
+    `CREATE FUNCTION switchboard_null_read_at()
+     RETURNS trigger
+     LANGUAGE plpgsql AS $$
+     BEGIN
+       NEW.read_at := NULL;
+       RETURN NEW;
+     END;
+     $$`,
+  );
+  await admin.query(
+    `CREATE TRIGGER switchboard_null_read_at
+     BEFORE UPDATE ON message_receipts
+     FOR EACH ROW
+     EXECUTE FUNCTION switchboard_null_read_at()`,
+  );
+  try {
+    const receipt = await markRead(alpha.token, [sent.id]);
+    expect(receipt).toEqual({
+      read: [sent.id],
+      marked: [{ id: sent.id, readAt: null }],
+    });
+    const stored = await admin.query<{ read_at: Date | null }>(
+      `SELECT read_at
+       FROM message_receipts
+       WHERE message_id = $1 AND agent_id = $2`,
+      [sent.id, alpha.id],
+    );
+    expect(stored.rows[0]?.read_at).toBeNull();
+  } finally {
+    await admin.query(
+      'DROP TRIGGER IF EXISTS switchboard_null_read_at ON message_receipts',
+    );
+    await admin.query('DROP FUNCTION IF EXISTS switchboard_null_read_at()');
+  }
+});
+
 test('agent B cannot read or mark agent A messages', async () => {
   const alpha = await register('alpha');
   const beta = await register('beta');
@@ -615,7 +730,9 @@ test('agent B cannot read or mark agent A messages', async () => {
     },
   });
   expect(mixed.statusCode).toBe(200);
-  expect(mixed.json()).toEqual({ read: [secret.id] });
+  const mixedReceipt = mixed.json() as ReadReceipt;
+  expect(mixedReceipt.read).toEqual([secret.id]);
+  expect(mixedReceipt.marked.map((item) => item.id)).toEqual([secret.id]);
   expect(mixed.body).not.toContain(alpha.token);
 
   const otherQuery = await app.inject({
@@ -647,7 +764,11 @@ test('broadcast fan-out keeps read state per recipient', async () => {
     readAt: null,
   });
 
-  expect(await markRead(beta.token, [sent.id])).toEqual({ read: [sent.id] });
+  const betaRead = await markRead(beta.token, [sent.id]);
+  expect(betaRead.read).toEqual([sent.id]);
+  expect(betaRead.marked).toEqual([
+    { id: sent.id, readAt: expect.any(String) },
+  ]);
   expect(await inbox(beta.token, true)).toEqual({
     messages: [],
     next: null,
@@ -655,7 +776,10 @@ test('broadcast fan-out keeps read state per recipient', async () => {
   expect(
     (await inbox(gamma.token, true)).messages.map((message) => message.id),
   ).toEqual([sent.id]);
-  expect(await markRead(alpha.token, [sent.id])).toEqual({ read: [] });
+  expect(await markRead(alpha.token, [sent.id])).toEqual({
+    read: [],
+    marked: [],
+  });
 
   const reads = await admin.query<{ name: string; read: boolean }>(
     `SELECT agents.name, message_receipts.read_at IS NOT NULL AS read
