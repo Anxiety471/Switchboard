@@ -36,7 +36,8 @@ function isFailure(value: string): value is DeskFailure {
     value === 'not_found' ||
     value === 'failed' ||
     value === 'unknown' ||
-    value === 'handover'
+    value === 'handover' ||
+    value === 'limited'
   );
 }
 

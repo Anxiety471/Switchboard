@@ -145,6 +145,14 @@ test('shows an issued token once in the slip and explains outages', () => {
     model: { kind: 'login' },
   });
   expect(login).toContain('That desk key was not accepted.');
+
+  const limited = html({
+    theme: 'system',
+    query,
+    flash: { type: 'failure', failure: 'limited' },
+    model: { kind: 'login' },
+  });
+  expect(limited).toContain('Too many attempts, try again later.');
   expect(login).toContain('Desk key');
   expect(login).not.toContain('01 Register');
 

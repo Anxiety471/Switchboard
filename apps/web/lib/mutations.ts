@@ -42,7 +42,7 @@ const AGENT_ID =
 
 export type DeskAction =
   | { kind: 'redirect'; location: string; cookies: string[] }
-  | { kind: 'status'; status: 400 | 403 | 429 };
+  | { kind: 'status'; status: 400 | 403 };
 
 export type LedgerWrites = {
   registerAgent(
@@ -99,7 +99,7 @@ export type DeskFormInput = {
   host: string | null;
   sessionId: string | undefined;
   tokenCookie: string | undefined;
-  clientKey: string;
+  clientKey: string | undefined;
   now?: number;
   writes?: LedgerWrites;
   directory?: DeskDirectory;
@@ -109,9 +109,11 @@ function redirect(location: string, cookies: string[] = []): DeskAction {
   return { kind: 'redirect', location, cookies };
 }
 
-function status(code: 400 | 403 | 429): DeskAction {
+function status(code: 400 | 403): DeskAction {
   return { kind: 'status', status: code };
 }
+
+const SHARED_LOGIN_KEY = 'shared';
 
 function isAction(value: { id: string } | DeskAction): value is DeskAction {
   return 'kind' in value;
@@ -221,21 +223,28 @@ export async function handleDeskForm(
     if (!formCsrfValid(config.secret, csrfField(form), now)) {
       return status(403);
     }
-    if (loginLimited(input.clientKey, now)) {
-      return status(429);
-    }
     const password = form.get('password');
-    const accepted =
-      typeof password === 'string' && secretsEqual(config.secret, password);
+    const presented = typeof password === 'string' ? password : '';
+    const accepted = secretsEqual(config.secret, presented);
+    const clientKey = input.clientKey;
+    if (clientKey !== undefined && loginLimited(clientKey, now)) {
+      return redirect('/?error=limited');
+    }
     if (!accepted) {
-      noteLoginFailure(input.clientKey, now);
+      const bucket = clientKey ?? SHARED_LOGIN_KEY;
+      if (loginLimited(bucket, now)) {
+        return redirect('/?error=limited');
+      }
+      noteLoginFailure(bucket, now);
       return redirect('/?error=unauthorized');
     }
     const opened = await directory.openSession(config);
     if (!opened.ok) {
       return redirect(`/?error=${opened.failure}`);
     }
-    clearLoginFailures(input.clientKey);
+    if (clientKey !== undefined) {
+      clearLoginFailures(clientKey);
+    }
     return redirect('/', [
       serializeCookie(DESK_COOKIE, opened.value.id, sessionCookie(secure)),
       clearCookie(FLASH_COOKIE, secure),

@@ -20,7 +20,8 @@ export type DeskFailure =
   | 'not_found'
   | 'failed'
   | 'unknown'
-  | 'handover';
+  | 'handover'
+  | 'limited';
 
 export type DeskResult<T> =
   { ok: true; value: T } | { ok: false; failure: DeskFailure };
@@ -453,7 +454,8 @@ function isFailure(value: unknown): value is DeskFailure {
     value === 'not_found' ||
     value === 'failed' ||
     value === 'unknown' ||
-    value === 'handover'
+    value === 'handover' ||
+    value === 'limited'
   );
 }
 

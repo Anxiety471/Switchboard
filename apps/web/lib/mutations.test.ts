@@ -284,7 +284,11 @@ test('repeated login failures are limited and do not grow a notice store', async
   }
   expect(
     await handleDeskForm(form, input(directory, { clientKey: 'limited' })),
-  ).toEqual({ kind: 'status', status: 429 });
+  ).toEqual({
+    kind: 'redirect',
+    location: '/?error=limited',
+    cookies: [],
+  });
   expect(directory.saves).toBe(0);
   expect(directory.session).toBeUndefined();
 
@@ -292,7 +296,11 @@ test('repeated login failures are limited and do not grow a notice store', async
     fields({ intent: 'login', password: SECRET, csrf }),
     input(directory, { clientKey: 'limited' }),
   );
-  expect(locked).toEqual({ kind: 'status', status: 429 });
+  expect(locked).toEqual({
+    kind: 'redirect',
+    location: '/?error=limited',
+    cookies: [],
+  });
   expect(directory.session).toBeUndefined();
 
   const other = memoryDirectory();
@@ -323,7 +331,11 @@ test('repeated login failures are limited and do not grow a notice store', async
       }),
       input(windowed, { clientKey: 'window', now: during }),
     ),
-  ).toEqual({ kind: 'status', status: 429 });
+  ).toEqual({
+    kind: 'redirect',
+    location: '/?error=limited',
+    cookies: [],
+  });
   const released = start + 10 * 60 * 1000;
   const opened = await handleDeskForm(
     fields({
@@ -335,6 +347,58 @@ test('repeated login failures are limited and do not grow a notice store', async
   );
   expect(opened).toMatchObject({ kind: 'redirect', location: '/' });
   expect(windowed.session).toBeDefined();
+});
+
+test('an unknown address still accepts the correct key after shared wrong guesses', async () => {
+  const directory = memoryDirectory();
+  const csrf = issueFormCsrf(SECRET);
+  const wrong = fields({ intent: 'login', password: 'nope', csrf });
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const denied = await handleDeskForm(
+      wrong,
+      input(directory, { clientKey: undefined }),
+    );
+    expect(denied).toMatchObject({
+      kind: 'redirect',
+      location: '/?error=unauthorized',
+    });
+  }
+
+  const opened = await handleDeskForm(
+    fields({ intent: 'login', password: SECRET, csrf }),
+    input(directory, { clientKey: undefined }),
+  );
+  expect(opened).toMatchObject({ kind: 'redirect', location: '/' });
+  expect(directory.session).toBeDefined();
+
+  const other = memoryDirectory();
+  const ninth = await handleDeskForm(
+    wrong,
+    input(other, { clientKey: undefined }),
+  );
+  expect(ninth).toEqual({
+    kind: 'redirect',
+    location: '/?error=limited',
+    cookies: [],
+  });
+  expect(other.session).toBeUndefined();
+
+  const still = await handleDeskForm(
+    fields({ intent: 'login', password: SECRET, csrf }),
+    input(other, { clientKey: undefined }),
+  );
+  expect(still).toMatchObject({ kind: 'redirect', location: '/' });
+  expect(other.session).toBeDefined();
+
+  const after = await handleDeskForm(
+    wrong,
+    input(memoryDirectory(), { clientKey: undefined }),
+  );
+  expect(after).toEqual({
+    kind: 'redirect',
+    location: '/?error=limited',
+    cookies: [],
+  });
 });
 
 test('register, issue, and revoke require the session csrf token', async () => {

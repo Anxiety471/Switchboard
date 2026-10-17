@@ -59,6 +59,14 @@ test('the home route keeps the desk locked until the session and API are ready',
   );
   expect(login).toContain('Desk key');
   expect(login).toContain('That desk key was not accepted.');
+
+  const limited = renderToStaticMarkup(
+    await HomePage({
+      searchParams: Promise.resolve({ error: 'limited' }),
+    }),
+  );
+  expect(limited).toContain('Too many attempts, try again later.');
+  expect(limited).toContain('Desk key');
   expect(login).toContain('name="csrf"');
   expect(login).not.toContain('01 Register');
   expect(login).not.toContain('error=unauthorized');

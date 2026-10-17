@@ -1,12 +1,13 @@
 import { DESK_COOKIE, TOKEN_COOKIE } from '../../lib/desk';
-import {
-  deskClientKey,
-  socketAddress,
-  trustProxyEnabled,
-} from '../../lib/login-limit';
+import { deskClientKey, trustProxyEnabled } from '../../lib/login-limit';
 import { handleDeskForm } from '../../lib/mutations';
 
 export const dynamic = 'force-dynamic';
+
+function envValue(name: string): string | undefined {
+  const value = process.env[name];
+  return typeof value === 'string' ? value : undefined;
+}
 
 export async function POST(request: Request): Promise<Response> {
   let form: FormData;
@@ -17,15 +18,14 @@ export async function POST(request: Request): Promise<Response> {
   }
   const action = await handleDeskForm(form, {
     env: process.env,
-    secure: process.env.COOKIE_SECURE === 'true',
+    secure: envValue('COOKIE_SECURE') === 'true',
     origin: request.headers.get('origin'),
     host: requestHost(request),
     sessionId: cookieValue(request, DESK_COOKIE),
     tokenCookie: cookieValue(request, TOKEN_COOKIE),
     clientKey: deskClientKey({
       forwardedFor: request.headers.get('x-forwarded-for'),
-      socketAddress: socketAddress(request),
-      trustProxy: trustProxyEnabled(process.env.TRUST_PROXY),
+      trustProxy: trustProxyEnabled(envValue('TRUST_PROXY')),
     }),
   });
   if (action.kind === 'status') {

@@ -472,22 +472,41 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
       let result;
       try {
         result = await pool.query<{ id: string; name: string }>(
-          `WITH touched AS (
-           UPDATE agents
-           SET last_seen_at = clock_timestamp()
+          `WITH expired AS (
+             UPDATE agents
+             SET pending_token_hash = NULL,
+                 pending_expires_at = NULL
+             WHERE pending_token_hash = $1
+               AND pending_expires_at <= clock_timestamp()
+             RETURNING id
+           ),
+           touched AS (
+             UPDATE agents
+             SET last_seen_at = clock_timestamp()
+             WHERE (
+                 (token_revoked = false AND token_hash = $1)
+                 OR (
+                   pending_token_hash = $1
+                   AND pending_expires_at > clock_timestamp()
+                 )
+               )
+               AND (
+                 last_seen_at IS NULL
+                 OR last_seen_at < clock_timestamp() - interval '10 seconds'
+               )
+             RETURNING id
+           )
+           SELECT agents.id, agents.name
+           FROM agents
+           LEFT JOIN touched ON false
            WHERE (
-               (token_revoked = false AND token_hash = $1)
-               OR pending_token_hash = $1
+               (agents.token_revoked = false AND agents.token_hash = $1)
+               OR (
+                 agents.pending_token_hash = $1
+                 AND agents.pending_expires_at > clock_timestamp()
+               )
              )
-             AND (
-               last_seen_at IS NULL
-               OR last_seen_at < clock_timestamp() - interval '10 seconds'
-             )
-         )
-         SELECT id, name
-         FROM agents
-         WHERE (token_revoked = false AND token_hash = $1)
-            OR pending_token_hash = $1`,
+             AND agents.id NOT IN (SELECT id FROM expired)`,
           [hashToken(token)],
         );
       } catch (error) {

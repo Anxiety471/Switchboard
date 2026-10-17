@@ -77,34 +77,14 @@ function forwardedClient(header: string | null): string | undefined {
 
 export function deskClientKey(input: {
   forwardedFor: string | null;
-  socketAddress: string | null;
   trustProxy: boolean;
-}): string {
-  if (input.trustProxy) {
-    const forwarded = forwardedClient(input.forwardedFor);
-    if (forwarded !== undefined) {
-      return `fwd:${forwarded}`;
-    }
+}): string | undefined {
+  if (!input.trustProxy) {
+    return undefined;
   }
-  if (input.socketAddress !== null && input.socketAddress !== '') {
-    return `sock:${input.socketAddress}`;
+  const forwarded = forwardedClient(input.forwardedFor);
+  if (forwarded === undefined) {
+    return undefined;
   }
-  return 'sock:unknown';
-}
-
-export function socketAddress(request: Request): string | null {
-  const candidate = request as Request & {
-    socket?: { remoteAddress?: unknown };
-    ip?: unknown;
-  };
-  if (
-    typeof candidate.socket?.remoteAddress === 'string' &&
-    candidate.socket.remoteAddress !== ''
-  ) {
-    return candidate.socket.remoteAddress;
-  }
-  if (typeof candidate.ip === 'string' && candidate.ip !== '') {
-    return candidate.ip;
-  }
-  return null;
+  return `fwd:${forwarded}`;
 }

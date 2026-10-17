@@ -91,6 +91,8 @@ function requiredRow<T>(rows: readonly T[]): T {
   return row;
 }
 
+const PENDING_TTL = '120 seconds';
+
 async function storePendingToken(
   pool: Pool,
   agentId: string,
@@ -102,13 +104,20 @@ async function storePendingToken(
   if (existing.rows[0] === undefined) {
     return undefined;
   }
+  await pool.query(
+    `UPDATE agents
+     SET pending_token_hash = NULL,
+         pending_expires_at = NULL
+     WHERE pending_expires_at <= clock_timestamp()`,
+  );
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const token = generateToken();
     const hash = hashToken(token);
     try {
       const result = await pool.query<{ id: string; name: string }>(
         `UPDATE agents
-         SET pending_token_hash = $2
+         SET pending_token_hash = $2,
+             pending_expires_at = clock_timestamp() + $3::interval
          WHERE id = $1::uuid
            AND NOT EXISTS (
              SELECT 1
@@ -117,7 +126,7 @@ async function storePendingToken(
                 OR other.pending_token_hash = $2
            )
          RETURNING id, name`,
-        [agentId, hash],
+        [agentId, hash, PENDING_TTL],
       );
       const row = result.rows[0];
       if (row === undefined) {
@@ -145,7 +154,8 @@ async function revokeStoredToken(
         `UPDATE agents
          SET token_hash = $2,
              token_revoked = true,
-             pending_token_hash = NULL
+             pending_token_hash = NULL,
+             pending_expires_at = NULL
          WHERE id = $1::uuid
          RETURNING id, name`,
         [agentId, hash],
@@ -286,17 +296,32 @@ export function registerDashboardRoutes(
           created_at: Date | string;
           token_revoked: boolean;
         }>(
-          `SELECT id,
+          `WITH expired AS (
+             UPDATE agents
+             SET pending_token_hash = NULL,
+                 pending_expires_at = NULL
+             WHERE pending_expires_at <= clock_timestamp()
+             RETURNING id
+           )
+           SELECT id,
                 name,
                 created_at,
                 last_seen_at,
-                token_revoked,
+                (
+                  token_revoked
+                  AND NOT (
+                    pending_token_hash IS NOT NULL
+                    AND pending_expires_at > clock_timestamp()
+                  )
+                ) AS token_revoked,
                 (
                   last_seen_at IS NOT NULL
                   AND last_seen_at >= clock_timestamp() - $1::interval
                 ) AS online
-         FROM agents
-         ORDER BY name ASC`,
+           FROM agents
+           WHERE id IS NOT NULL
+              OR id IN (SELECT id FROM expired)
+           ORDER BY name ASC`,
           [onlineInterval],
         );
         const agents: DashboardAgent[] = result.rows.map((row) => ({
@@ -629,13 +654,31 @@ export function registerDashboardRoutes(
       },
       async (request, reply) => {
         const result = await pool.query<{ id: string; name: string }>(
-          `UPDATE agents
-           SET token_hash = pending_token_hash,
-               pending_token_hash = NULL,
-               token_revoked = false
-           WHERE id = $1::uuid
-             AND pending_token_hash IS NOT NULL
-           RETURNING id, name`,
+          `WITH expired AS (
+             UPDATE agents
+             SET pending_token_hash = NULL,
+                 pending_expires_at = NULL
+             WHERE id = $1::uuid
+               AND pending_expires_at <= clock_timestamp()
+             RETURNING id
+           ),
+           promoted AS (
+             UPDATE agents
+             SET token_hash = pending_token_hash,
+                 pending_token_hash = NULL,
+                 pending_expires_at = NULL,
+                 token_revoked = false
+             WHERE id = $1::uuid
+               AND pending_token_hash IS NOT NULL
+               AND pending_expires_at > clock_timestamp()
+             RETURNING id, name
+           )
+           SELECT id, name
+           FROM promoted
+           UNION ALL
+           SELECT id, NULL::text
+           FROM expired
+           WHERE false`,
           [request.params.id],
         );
         const row = result.rows[0];
@@ -661,7 +704,8 @@ export function registerDashboardRoutes(
       async (request, reply) => {
         await pool.query(
           `UPDATE agents
-           SET pending_token_hash = NULL
+           SET pending_token_hash = NULL,
+               pending_expires_at = NULL
            WHERE id = $1::uuid`,
           [request.params.id],
         );

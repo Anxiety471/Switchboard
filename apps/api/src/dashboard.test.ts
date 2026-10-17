@@ -505,6 +505,107 @@ test('a new token works beside the old one until handover is confirmed', async (
   expect(replacement).toMatchObject({ id: created.id, name: 'alpha' });
 });
 
+test('an expired pending token stops working and the previous token remains', async () => {
+  const created = await register('alpha');
+  const issued = await app.inject({
+    method: 'POST',
+    url: `/dashboard/agents/${created.id}/token`,
+    headers: desk(),
+  });
+  expect(issued.statusCode).toBe(201);
+  const next = issued.json() as RegisteredAgent;
+  expect(await bearerStatus(created.token)).toBe(200);
+  expect(await bearerStatus(next.token)).toBe(200);
+
+  await admin.query(
+    `UPDATE agents
+     SET pending_expires_at = clock_timestamp() - interval '1 second'
+     WHERE id = $1`,
+    [created.id],
+  );
+  expect(await bearerStatus(next.token)).toBe(401);
+  expect(await bearerStatus(created.token)).toBe(200);
+  const stored = await admin.query<{
+    pending_token_hash: Buffer | null;
+    pending_expires_at: Date | null;
+  }>(
+    `SELECT pending_token_hash, pending_expires_at
+     FROM agents
+     WHERE id = $1`,
+    [created.id],
+  );
+  expect(stored.rows[0]?.pending_token_hash).toBeNull();
+  expect(stored.rows[0]?.pending_expires_at).toBeNull();
+  const confirmed = await app.inject({
+    method: 'POST',
+    url: `/dashboard/agents/${created.id}/token/confirm`,
+    headers: desk(),
+  });
+  expect(confirmed.statusCode).toBe(404);
+  expect(await bearerStatus(created.token)).toBe(200);
+});
+
+test('a pending token after revoke is not shown as revoked', async () => {
+  const created = await register('alpha');
+  const revoked = await app.inject({
+    method: 'POST',
+    url: `/dashboard/agents/${created.id}/token/revoke`,
+    headers: desk(),
+  });
+  expect(revoked.statusCode).toBe(200);
+  const locked = await app.inject({
+    method: 'GET',
+    url: '/dashboard/agents',
+    headers: desk(),
+  });
+  expect(
+    (locked.json() as { agents: DashboardAgent[] }).agents[0]?.tokenRevoked,
+  ).toBe(true);
+
+  const issued = await app.inject({
+    method: 'POST',
+    url: `/dashboard/agents/${created.id}/token`,
+    headers: desk(),
+  });
+  expect(issued.statusCode).toBe(201);
+  const next = issued.json() as RegisteredAgent;
+  expect(await bearerStatus(next.token)).toBe(200);
+  const pending = await app.inject({
+    method: 'GET',
+    url: '/dashboard/agents',
+    headers: desk(),
+  });
+  expect(
+    (pending.json() as { agents: DashboardAgent[] }).agents[0],
+  ).toMatchObject({
+    id: created.id,
+    name: 'alpha',
+    tokenRevoked: false,
+  });
+  const column = await admin.query<{ token_revoked: boolean }>(
+    'SELECT token_revoked FROM agents WHERE id = $1',
+    [created.id],
+  );
+  expect(column.rows[0]?.token_revoked).toBe(true);
+
+  await admin.query(
+    `UPDATE agents
+     SET pending_expires_at = clock_timestamp() - interval '1 second'
+     WHERE id = $1`,
+    [created.id],
+  );
+  const expired = await app.inject({
+    method: 'GET',
+    url: '/dashboard/agents',
+    headers: desk(),
+  });
+  expect(
+    (expired.json() as { agents: DashboardAgent[] }).agents[0]?.tokenRevoked,
+  ).toBe(true);
+  expect(await bearerStatus(next.token)).toBe(401);
+  expect(await bearerStatus(created.token)).toBe(401);
+});
+
 test('message history is oldest-first, paged, and marks broadcasts', async () => {
   const alpha = await register('alpha');
   const beta = await register('beta');

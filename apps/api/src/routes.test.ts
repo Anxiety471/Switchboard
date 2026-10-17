@@ -126,6 +126,7 @@ test('migration creates agents, messages, and per-recipient receipts', async () 
     { table_name: 'agents', column_name: 'id' },
     { table_name: 'agents', column_name: 'last_seen_at' },
     { table_name: 'agents', column_name: 'name' },
+    { table_name: 'agents', column_name: 'pending_expires_at' },
     { table_name: 'agents', column_name: 'pending_token_hash' },
     { table_name: 'agents', column_name: 'token_hash' },
     { table_name: 'agents', column_name: 'token_revoked' },
