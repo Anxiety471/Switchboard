@@ -622,6 +622,38 @@ test('check_inbox uses each returned readAt and ignores the Date header', async 
   }
 });
 
+test('check_inbox accepts an older mark-read response without marked', async () => {
+  const id = '00000000-0000-4000-8000-000000000001';
+  const body = `older api ${'o'.repeat(120)} end`;
+  let reads = 0;
+  const mock = await startMock((request) => {
+    if (request.pathname === '/inbox/read') {
+      reads += 1;
+      return { status: 200, json: { read: [id] } };
+    }
+    return {
+      status: 200,
+      json: { messages: [{ ...message(id), body }], next: null },
+    };
+  });
+  const session = await connect(mock.url);
+  try {
+    const result = await callTool(session.client, 'check_inbox');
+    expect(result.isError).toBe(false);
+    expect(result.text).toContain(body);
+    expect(result.text).not.toContain(MARK_READ_WARNING);
+    expect(result.value).toEqual({
+      messages: [{ ...message(id), body, readAt: null }],
+      next: null,
+      read: [id],
+    });
+    expect(reads).toBe(1);
+  } finally {
+    await session.close();
+    await mock.close();
+  }
+});
+
 test('check_inbox returns the page when mark-read stays unconfirmed', async () => {
   const id = '00000000-0000-4000-8000-000000000001';
   const body = `visible-after-failure ${'n'.repeat(180)} end`;

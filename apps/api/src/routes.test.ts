@@ -626,6 +626,51 @@ test('POST /inbox/read returns each stored read_at', async () => {
   });
 });
 
+test('POST /inbox/read returns null readAt when the stored value is null', async () => {
+  const alpha = await register('alpha');
+  const beta = await register('beta');
+  const sent = await send(beta.token, { to: 'alpha', body: 'null read' });
+  await admin.query(
+    'DROP TRIGGER IF EXISTS switchboard_null_read_at ON message_receipts',
+  );
+  await admin.query('DROP FUNCTION IF EXISTS switchboard_null_read_at()');
+  await admin.query(
+    `CREATE FUNCTION switchboard_null_read_at()
+     RETURNS trigger
+     LANGUAGE plpgsql AS $$
+     BEGIN
+       NEW.read_at := NULL;
+       RETURN NEW;
+     END;
+     $$`,
+  );
+  await admin.query(
+    `CREATE TRIGGER switchboard_null_read_at
+     BEFORE UPDATE ON message_receipts
+     FOR EACH ROW
+     EXECUTE FUNCTION switchboard_null_read_at()`,
+  );
+  try {
+    const receipt = await markRead(alpha.token, [sent.id]);
+    expect(receipt).toEqual({
+      read: [sent.id],
+      marked: [{ id: sent.id, readAt: null }],
+    });
+    const stored = await admin.query<{ read_at: Date | null }>(
+      `SELECT read_at
+       FROM message_receipts
+       WHERE message_id = $1 AND agent_id = $2`,
+      [sent.id, alpha.id],
+    );
+    expect(stored.rows[0]?.read_at).toBeNull();
+  } finally {
+    await admin.query(
+      'DROP TRIGGER IF EXISTS switchboard_null_read_at ON message_receipts',
+    );
+    await admin.query('DROP FUNCTION IF EXISTS switchboard_null_read_at()');
+  }
+});
+
 test('agent B cannot read or mark agent A messages', async () => {
   const alpha = await register('alpha');
   const beta = await register('beta');

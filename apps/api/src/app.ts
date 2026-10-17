@@ -198,12 +198,8 @@ function isoTime(value: Date | string | null): string | null {
   return new Date(value).toISOString();
 }
 
-function requiredIsoTime(value: Date | string | null): string {
-  const iso = isoTime(value);
-  if (iso === null) {
-    throw new Error('expected a timestamp');
-  }
-  return iso;
+function requiredIsoTime(value: Date | string | null): string | null {
+  return isoTime(value);
 }
 
 function caller(request: {
@@ -849,7 +845,7 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
                   required: ['id', 'readAt'],
                   properties: {
                     id: { type: 'string' },
-                    readAt: { type: 'string' },
+                    readAt: { type: ['string', 'null'] },
                   },
                 },
               },

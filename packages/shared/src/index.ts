@@ -33,7 +33,7 @@ export type InboxPage = {
 
 export type MarkedRead = {
   id: string;
-  readAt: string;
+  readAt: string | null;
 };
 
 export type ReadReceipt = {

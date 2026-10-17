@@ -344,7 +344,7 @@ function parseMarked(value: unknown): MarkedRead {
   if (
     !isRecord(value) ||
     typeof value.id !== 'string' ||
-    typeof value.readAt !== 'string'
+    !(value.readAt === null || typeof value.readAt === 'string')
   ) {
     throw new SwitchboardError(200, 'request_failed');
   }
@@ -352,11 +352,16 @@ function parseMarked(value: unknown): MarkedRead {
 }
 
 function parseRead(value: unknown): ReadReceipt {
-  if (
-    !isRecord(value) ||
-    !isStringArray(value.read) ||
-    !Array.isArray(value.marked)
-  ) {
+  if (!isRecord(value) || !isStringArray(value.read)) {
+    throw new SwitchboardError(200, 'request_failed');
+  }
+  if (value.marked === undefined) {
+    return {
+      read: value.read,
+      marked: value.read.map((id) => ({ id, readAt: null })),
+    };
+  }
+  if (!Array.isArray(value.marked)) {
     throw new SwitchboardError(200, 'request_failed');
   }
   const marked = value.marked.map(parseMarked);
