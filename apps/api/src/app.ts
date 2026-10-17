@@ -1,13 +1,19 @@
 import type { IncomingHttpHeaders } from 'node:http';
 import Fastify, { type FastifyError } from 'fastify';
 import { Pool, type PoolClient } from 'pg';
-import type {
-  AgentSummary,
-  InboxMessage,
-  InboxPage,
-  ReadReceipt,
-  RegisteredAgent,
-  SentMessage,
+import {
+  encodeSearchCursor,
+  MAX_SEARCH_TEXT_BYTES,
+  parseFilterTime,
+  parseInboxCursor,
+  parseSearchCursor as decodeSearchCursor,
+  type AgentSummary,
+  type InboxMessage,
+  type InboxPage,
+  type MessageCursor,
+  type ReadReceipt,
+  type RegisteredAgent,
+  type SentMessage,
 } from '@switchboard/shared';
 import { migrate } from './migrate.js';
 import { generateToken, hashToken, secretsEqual } from './token.js';
@@ -29,10 +35,15 @@ const KEEPALIVE_INITIAL_DELAY_MS = 10_000;
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const UUID_PATTERN =
   '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';
-const CURSOR_PATTERN =
-  /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\|([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$/;
-const FILTER_TIME_PATTERN =
-  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/;
+const SEARCH_INPUT_ERRORS = new Set([
+  '22007',
+  '22008',
+  '22009',
+  '22019',
+  '2200C',
+  '22025',
+  '22P02',
+]);
 
 const REDACT_PATHS = [
   'req.headers.authorization',
@@ -124,11 +135,6 @@ type SearchQuery = {
   cursor?: string;
 };
 
-type InboxCursor = {
-  createdAt: string;
-  id: string;
-};
-
 function requestPath(url: string): string {
   const query = url.indexOf('?');
   return query === -1 ? url : url.slice(0, query);
@@ -176,9 +182,9 @@ function pgField(
   return typeof value === 'string' ? value : undefined;
 }
 
-function isDataException(error: unknown): boolean {
+function isSearchInputError(error: unknown): boolean {
   const code = pgField(error, 'code');
-  return code !== undefined && code.startsWith('22');
+  return code !== undefined && SEARCH_INPUT_ERRORS.has(code);
 }
 
 function statusCodeOf(error: unknown): number {
@@ -255,109 +261,29 @@ function searchLimit(value: string | undefined): number | undefined {
   return parsed;
 }
 
-function isCursorTime(value: string): boolean {
-  const year = Number(value.slice(0, 4));
-  if (!Number.isInteger(year) || year < 1 || year > 9999) {
-    return false;
-  }
-  const parsed = new Date(value);
-  return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
-}
-
 function parseCursor(
   value: string | undefined,
-): InboxCursor | null | undefined {
+): MessageCursor | null | undefined {
   if (value === undefined) {
     return null;
   }
-  const match = CURSOR_PATTERN.exec(value);
-  const createdAt = match?.[1];
-  const id = match?.[2];
-  if (createdAt === undefined || id === undefined || !isCursorTime(createdAt)) {
-    return undefined;
-  }
-  return { createdAt, id };
-}
-
-function encodeSearchCursor(createdAt: string, id: string): string {
-  return Buffer.from(`${createdAt}|${id}`, 'utf8').toString('base64url');
+  return parseInboxCursor(value);
 }
 
 function parseSearchCursor(
   value: string | undefined,
-): InboxCursor | null | undefined {
+): MessageCursor | null | undefined {
   if (value === undefined) {
     return null;
   }
-  if (!/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
-    return undefined;
-  }
-  const decoded = Buffer.from(value, 'base64url').toString('utf8');
-  if (Buffer.from(decoded, 'utf8').toString('base64url') !== value) {
-    return undefined;
-  }
-  const match = CURSOR_PATTERN.exec(decoded);
-  const createdAt = match?.[1];
-  const id = match?.[2];
-  if (createdAt === undefined || id === undefined || !isCursorTime(createdAt)) {
-    return undefined;
-  }
-  return { createdAt, id };
-}
-
-function offsetMinutes(offset: string): number | undefined {
-  if (offset === 'Z') {
-    return 0;
-  }
-  const match = /^([+-])(\d{2}):(\d{2})$/.exec(offset);
-  const sign = match?.[1];
-  const hours = match?.[2];
-  const minutes = match?.[3];
-  if (sign === undefined || hours === undefined || minutes === undefined) {
-    return undefined;
-  }
-  const hour = Number(hours);
-  const minute = Number(minutes);
-  if (hour > 23 || minute > 59) {
-    return undefined;
-  }
-  return (sign === '-' ? -1 : 1) * (hour * 60 + minute);
+  return decodeSearchCursor(value);
 }
 
 function filterTime(value: string | undefined): string | null | undefined {
   if (value === undefined) {
     return null;
   }
-  const match = FILTER_TIME_PATTERN.exec(value);
-  const yearText = match?.[1];
-  const offset = match?.[8];
-  if (yearText === undefined || offset === undefined || match === null) {
-    return undefined;
-  }
-  const year = Number(yearText);
-  if (!Number.isInteger(year) || year < 1 || year > 9999) {
-    return undefined;
-  }
-  const parsed = new Date(value);
-  const shift = offsetMinutes(offset);
-  if (Number.isNaN(parsed.getTime()) || shift === undefined) {
-    return undefined;
-  }
-  const wall = new Date(parsed.getTime() + shift * 60_000);
-  const fields = [1, 2, 3, 4, 5, 6].map((group) => Number(match[group]));
-  if (
-    wall.getUTCFullYear() !== fields[0] ||
-    wall.getUTCMonth() + 1 !== fields[1] ||
-    wall.getUTCDate() !== fields[2] ||
-    wall.getUTCHours() !== fields[3] ||
-    wall.getUTCMinutes() !== fields[4] ||
-    wall.getUTCSeconds() !== fields[5] ||
-    wall.getUTCFullYear() < 1 ||
-    wall.getUTCFullYear() > 9999
-  ) {
-    return undefined;
-  }
-  return parsed.toISOString();
+  return parseFilterTime(value);
 }
 
 function escapeLike(value: string): string {
@@ -367,7 +293,7 @@ function escapeLike(value: string): string {
 async function searchCursorAllowed(
   pool: Pool,
   agentId: string,
-  cursor: InboxCursor,
+  cursor: MessageCursor,
 ): Promise<boolean> {
   const result = await pool.query<{
     time_matches: boolean;
@@ -965,7 +891,11 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
             },
             since: { type: 'string', minLength: 1, maxLength: 40 },
             until: { type: 'string', minLength: 1, maxLength: 40 },
-            text: { type: 'string', minLength: 1, maxLength: MAX_BODY_BYTES },
+            text: {
+              type: 'string',
+              minLength: 1,
+              maxLength: MAX_SEARCH_TEXT_BYTES,
+            },
             box: { type: 'string', enum: ['received', 'sent'] },
             limit: { type: 'string', pattern: '^[1-9][0-9]{0,2}$' },
             cursor: { type: 'string', minLength: 1, maxLength: 128 },
@@ -1013,12 +943,17 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
         until === undefined ||
         (text !== undefined &&
           (text.includes('\0') ||
-            Buffer.byteLength(text, 'utf8') > MAX_BODY_BYTES))
+            Buffer.byteLength(text, 'utf8') > MAX_SEARCH_TEXT_BYTES))
       ) {
         return reply.code(400).send({ error: 'invalid request' });
       }
       const status = request.query.status ?? 'unread';
       const box = request.query.box ?? 'received';
+      if (box !== 'received' && box !== 'sent') {
+        return reply.code(400).send({ error: 'invalid request' });
+      }
+      const visibility =
+        box === 'sent' ? 'm.from_agent = $1::uuid' : 'own.agent_id IS NOT NULL';
       try {
         if (cursor !== null) {
           const allowed = await searchCursorAllowed(pool, agent.id, cursor);
@@ -1061,10 +996,7 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
            LEFT JOIN message_receipts dest
              ON dest.message_id = m.id
             AND dest.agent_id = m.to_agent
-           WHERE (
-             ($2::text = 'received' AND own.agent_id IS NOT NULL)
-             OR ($2::text = 'sent' AND m.from_agent = $1::uuid)
-           )
+           WHERE ${visibility}
              AND (
                $3::text = 'all'
                OR (
@@ -1169,7 +1101,7 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
           app.log.error(unavailableLog(error), 'database unavailable');
           return reply.code(503).send(databaseUnavailableBody());
         }
-        if (isDataException(error)) {
+        if (isSearchInputError(error)) {
           return reply.code(400).send({ error: 'invalid request' });
         }
         throw error;

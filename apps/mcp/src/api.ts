@@ -46,6 +46,9 @@ export function mapApiError(status: number, body: unknown): SwitchboardError {
   if (status === 400 || status === 413) {
     return new SwitchboardError(status, 'invalid request');
   }
+  if (status === 414 || status === 431) {
+    return new SwitchboardError(status, 'request too large');
+  }
   if (status === 404) {
     return new SwitchboardError(status, 'not found');
   }

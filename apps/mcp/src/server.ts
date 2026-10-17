@@ -1,4 +1,10 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import {
+  MAX_SEARCH_TEXT_BYTES,
+  parseFilterTime,
+  parseInboxCursor,
+  parseSearchCursor,
+} from '@switchboard/shared';
 import { z } from 'zod';
 import { SwitchboardClient, SwitchboardError } from './api.js';
 import type { SwitchboardClientOptions } from './api.js';
@@ -6,81 +12,19 @@ import type { SwitchboardClientOptions } from './api.js';
 // Client-side checks give friendlier errors and mirror the API limits.
 const RECIPIENT = /^(?:\*|[A-Za-z0-9][A-Za-z0-9_-]{0,63})$/;
 const MAX_BODY_BYTES = 8192;
-const CURSOR =
-  /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
 const AGENT_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
-const FILTER_TIME =
-  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/;
 
 function validCursor(value: string): boolean {
-  const match = CURSOR.exec(value);
-  const createdAt = match?.[1];
-  if (createdAt === undefined) {
-    return false;
-  }
-  const year = Number(createdAt.slice(0, 4));
-  if (!Number.isInteger(year) || year < 1 || year > 9999) {
-    return false;
-  }
-  const parsed = new Date(createdAt);
-  return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === createdAt;
+  return parseInboxCursor(value) !== undefined;
 }
 
 function validSearchCursor(value: string): boolean {
-  if (!/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
-    return false;
-  }
-  const decoded = Buffer.from(value, 'base64url').toString('utf8');
-  if (Buffer.from(decoded, 'utf8').toString('base64url') !== value) {
-    return false;
-  }
-  return validCursor(decoded);
+  return parseSearchCursor(value) !== undefined;
 }
 
 function validFilterTime(value: string): boolean {
-  const match = FILTER_TIME.exec(value);
-  const yearText = match?.[1];
-  const offset = match?.[8];
-  if (yearText === undefined || offset === undefined || match === null) {
-    return false;
-  }
-  const year = Number(yearText);
-  if (!Number.isInteger(year) || year < 1 || year > 9999) {
-    return false;
-  }
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) {
-    return false;
-  }
-  let shift = 0;
-  if (offset !== 'Z') {
-    const parsedOffset = /^([+-])(\d{2}):(\d{2})$/.exec(offset);
-    const sign = parsedOffset?.[1];
-    const hours = parsedOffset?.[2];
-    const minutes = parsedOffset?.[3];
-    if (sign === undefined || hours === undefined || minutes === undefined) {
-      return false;
-    }
-    const hour = Number(hours);
-    const minute = Number(minutes);
-    if (hour > 23 || minute > 59) {
-      return false;
-    }
-    shift = (sign === '-' ? -1 : 1) * (hour * 60 + minute);
-  }
-  const wall = new Date(parsed.getTime() + shift * 60_000);
-  const fields = [1, 2, 3, 4, 5, 6].map((group) => Number(match[group]));
-  return (
-    wall.getUTCFullYear() === fields[0] &&
-    wall.getUTCMonth() + 1 === fields[1] &&
-    wall.getUTCDate() === fields[2] &&
-    wall.getUTCHours() === fields[3] &&
-    wall.getUTCMinutes() === fields[4] &&
-    wall.getUTCSeconds() === fields[5] &&
-    wall.getUTCFullYear() >= 1 &&
-    wall.getUTCFullYear() <= 9999
-  );
+  return parseFilterTime(value) !== undefined;
 }
 
 function messageBody() {
@@ -257,18 +201,18 @@ export function createMcpServer(options: SwitchboardClientOptions): McpServer {
         text: z
           .string()
           .min(1)
-          .max(MAX_BODY_BYTES)
+          .max(MAX_SEARCH_TEXT_BYTES)
           .refine(
             (value) =>
               !value.includes('\0') &&
-              Buffer.byteLength(value, 'utf8') <= MAX_BODY_BYTES,
+              Buffer.byteLength(value, 'utf8') <= MAX_SEARCH_TEXT_BYTES,
             {
-              message: 'text must be 1 to 8192 bytes and must not contain NUL',
+              message: `text must be 1 to ${MAX_SEARCH_TEXT_BYTES} bytes and must not contain NUL`,
             },
           )
           .optional()
           .describe(
-            'Case-insensitive body match. Percent, underscore, and backslash are literal',
+            `Case-insensitive body match. Percent, underscore, and backslash are literal. At most ${MAX_SEARCH_TEXT_BYTES} bytes`,
           ),
         box: z
           .enum(['received', 'sent'])

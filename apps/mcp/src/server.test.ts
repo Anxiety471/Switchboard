@@ -246,6 +246,8 @@ test('rejects invalid tool input before calling the API', async () => {
       ['search_messages', { until: '2026-02-30T00:00:00.000Z' }],
       ['search_messages', { text: '' }],
       ['search_messages', { text: 'bad\0byte' }],
+      ['search_messages', { text: 'a'.repeat(1025) }],
+      ['search_messages', { text: 'é'.repeat(513) }],
       ['search_messages', { limit: 0 }],
       ['search_messages', { limit: 101 }],
       ['search_messages', { cursor: 'nope' }],
@@ -423,6 +425,65 @@ test('search_messages reads one page and does not mark it read', async () => {
   } finally {
     await session.close();
     await mock.close();
+  }
+});
+
+test('search_messages accepts 1024-byte text', async () => {
+  const multibyte = 'é'.repeat(512);
+  const maxText = 'a'.repeat(1024);
+  expect(Buffer.byteLength(multibyte, 'utf8')).toBe(1024);
+  expect(Buffer.byteLength(maxText, 'utf8')).toBe(1024);
+  const mock = await startMock(() => ({
+    status: 200,
+    json: { messages: [], next: null },
+  }));
+  const session = await connect(mock.url);
+  try {
+    const wide = await callTool(session.client, 'search_messages', {
+      status: 'all',
+      text: multibyte,
+    });
+    const exact = await callTool(session.client, 'search_messages', {
+      status: 'all',
+      text: maxText,
+    });
+    expect(wide.isError).toBe(false);
+    expect(exact.isError).toBe(false);
+    expect(mock.requests).toHaveLength(2);
+    const first = new URLSearchParams(mock.requests[0]?.search);
+    const second = new URLSearchParams(mock.requests[1]?.search);
+    expect(first.get('text')).toBe(multibyte);
+    expect(second.get('text')).toBe(maxText);
+  } finally {
+    await session.close();
+    await mock.close();
+  }
+});
+
+test('search_messages maps HTTP 414 and 431 to request too large', async () => {
+  const secret = 'raw-header-dump';
+  for (const status of [414, 431]) {
+    const fetchImpl: typeof fetch = () =>
+      Promise.resolve(
+        new Response(`<html>${secret}</html>`, {
+          status,
+          headers: { 'content-type': 'text/html' },
+        }),
+      );
+    const session = await connect('http://127.0.0.1:9', TOKEN, fetchImpl);
+    try {
+      const result = await callTool(session.client, 'search_messages', {
+        text: 'hello',
+      });
+      expect(result.isError).toBe(true);
+      expect(apiError(result.text)).toEqual({
+        error: 'request too large',
+        status,
+      });
+      expect(result.text).not.toContain(secret);
+    } finally {
+      await session.close();
+    }
   }
 });
 

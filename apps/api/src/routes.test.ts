@@ -3,12 +3,14 @@ import { Client } from 'pg';
 import { afterAll, beforeAll, beforeEach, expect, test } from 'vitest';
 import { buildApp } from './app.js';
 import { assertTestDatabaseUrl } from './test-helpers/test-database.js';
-import type {
-  AgentSummary,
-  InboxPage,
-  ReadReceipt,
-  RegisteredAgent,
-  SentMessage,
+import {
+  encodeSearchCursor,
+  MAX_SEARCH_TEXT_BYTES,
+  type AgentSummary,
+  type InboxPage,
+  type ReadReceipt,
+  type RegisteredAgent,
+  type SentMessage,
 } from '@switchboard/shared';
 
 const databaseUrl = assertTestDatabaseUrl(process.env.TEST_DATABASE_URL);
@@ -96,7 +98,7 @@ async function markRead(token: string, ids: string[]): Promise<ReadReceipt> {
 }
 
 function searchCursor(createdAt: string, id: string): string {
-  return Buffer.from(`${createdAt}|${id}`, 'utf8').toString('base64url');
+  return encodeSearchCursor(createdAt, id);
 }
 
 function bodies(page: InboxPage): string[] {
@@ -172,6 +174,14 @@ test('migration creates agents, messages, and per-recipient receipts', async () 
        AND indexname = 'agents_name_lower_idx'`,
   );
   expect(index.rowCount).toBe(1);
+
+  const sentIndex = await admin.query(
+    `SELECT 1
+     FROM pg_indexes
+     WHERE schemaname = 'public'
+       AND indexname = 'messages_from_agent_created_at_id_idx'`,
+  );
+  expect(sentIndex.rowCount).toBe(1);
 
   const uniqueName = await admin.query(
     `SELECT 1
@@ -1559,7 +1569,9 @@ test('GET /messages/search rejects invalid filters', async () => {
     'text=',
     'agent=alpha',
     'cursor=',
-    `text=${'é'.repeat(4097)}`,
+    `text=${'a'.repeat(1025)}`,
+    `text=${'é'.repeat(513)}`,
+    `text=${'é'.repeat(1024)}`,
     'text=%00',
   ];
   for (const query of cases) {
@@ -1572,4 +1584,148 @@ test('GET /messages/search rejects invalid filters', async () => {
     expect(response.json()).toEqual({ error: 'invalid request' });
   }
   expect((await search(alpha.token, { limit: 100 })).messages).toEqual([]);
+});
+
+test('GET /messages/search accepts 1024-byte text over real HTTP', async () => {
+  const httpApp = buildApp(databaseUrl);
+  try {
+    await httpApp.migrationsReady;
+    const address = await httpApp.listen({ host: '127.0.0.1', port: 0 });
+    const multibyte = 'é'.repeat(512);
+    const maxText = 'm'.repeat(1024);
+    expect(MAX_SEARCH_TEXT_BYTES).toBe(1024);
+    expect(Buffer.byteLength(multibyte, 'utf8')).toBe(MAX_SEARCH_TEXT_BYTES);
+    expect(Buffer.byteLength(maxText, 'utf8')).toBe(MAX_SEARCH_TEXT_BYTES);
+
+    const registered = await fetch(`${address}/agents`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'alpha' }),
+    });
+    expect(registered.status).toBe(201);
+    const alpha = (await registered.json()) as RegisteredAgent;
+    const sender = await fetch(`${address}/agents`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'beta' }),
+    });
+    expect(sender.status).toBe(201);
+    const beta = (await sender.json()) as RegisteredAgent;
+
+    for (const body of [multibyte, maxText]) {
+      const sent = await fetch(`${address}/messages`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${beta.token}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ to: 'alpha', body }),
+      });
+      expect(sent.status).toBe(201);
+    }
+
+    const searchText = async (text: string): Promise<InboxPage> => {
+      const params = new URLSearchParams({ status: 'all', text });
+      const response = await fetch(`${address}/messages/search?${params}`, {
+        headers: { authorization: `Bearer ${alpha.token}` },
+      });
+      expect(response.status, text.slice(0, 12)).toBe(200);
+      return response.json() as Promise<InboxPage>;
+    };
+
+    expect(bodies(await searchText(multibyte))).toEqual([multibyte]);
+    expect(bodies(await searchText(maxText))).toEqual([maxText]);
+
+    const rejected = async (text: string): Promise<void> => {
+      const params = new URLSearchParams({ status: 'all', text });
+      const response = await fetch(`${address}/messages/search?${params}`, {
+        headers: { authorization: `Bearer ${alpha.token}` },
+      });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: 'invalid request' });
+    };
+    await rejected('a'.repeat(1025));
+    const overBytes = 'é'.repeat(513);
+    expect(Buffer.byteLength(overBytes, 'utf8')).toBe(1026);
+    await rejected(overBytes);
+    const charCap = 'é'.repeat(1024);
+    expect(charCap).toHaveLength(1024);
+    expect(Buffer.byteLength(charCap, 'utf8')).toBe(2048);
+    await rejected(charCap);
+  } finally {
+    await httpApp.close();
+  }
+});
+
+test('GET /messages/search returns 500 for an unexpected data exception', async () => {
+  const databaseName = decodeURIComponent(
+    new URL(databaseUrl).pathname.replace(/^\//, ''),
+  );
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(databaseName)) {
+    throw new Error('unexpected test database name');
+  }
+  const logs: string[] = [];
+  let isolated: ReturnType<typeof buildApp> | undefined;
+  const forceDateTrunc = (code: '22007' | '22012'): Promise<unknown> =>
+    admin.query(
+      `CREATE OR REPLACE FUNCTION public.date_trunc(field text, source timestamptz)
+       RETURNS timestamptz
+       LANGUAGE plpgsql
+       AS $fn$
+       BEGIN
+         RAISE EXCEPTION 'forced data exception' USING ERRCODE = '${code}';
+       END;
+       $fn$`,
+    );
+  try {
+    await forceDateTrunc('22012');
+    await admin.query(
+      `ALTER DATABASE ${databaseName} SET search_path TO public, pg_catalog`,
+    );
+    isolated = buildApp(databaseUrl, {
+      max: 1,
+      logStream: {
+        write(message) {
+          logs.push(message);
+        },
+      },
+    });
+    await isolated.migrationsReady;
+    const alpha = await register('alpha');
+    const beta = await register('beta');
+    await send(beta.token, { to: 'alpha', body: 'hello' });
+    const unexpected = await isolated.inject({
+      method: 'GET',
+      url: '/messages/search?status=all',
+      headers: bearer(alpha.token),
+    });
+    expect(unexpected.statusCode).toBe(500);
+    expect(unexpected.json()).toEqual({ error: 'internal error' });
+    expect(unexpected.body).not.toContain('forced data exception');
+    expect(logs.join('\n')).toContain('request failed');
+    expect(logs.join('\n')).toContain('forced data exception');
+
+    const logged = logs.length;
+    await forceDateTrunc('22007');
+    const expected = await isolated.inject({
+      method: 'GET',
+      url: '/messages/search?status=all',
+      headers: bearer(alpha.token),
+    });
+    expect(expected.statusCode).toBe(400);
+    expect(expected.json()).toEqual({ error: 'invalid request' });
+    expect(expected.body).not.toContain('forced data exception');
+    const added = logs.slice(logged).join('\n');
+    expect(added).not.toContain('request failed');
+    expect(added).not.toContain('forced data exception');
+  } finally {
+    try {
+      await isolated?.close();
+    } finally {
+      await admin.query(
+        'DROP FUNCTION IF EXISTS public.date_trunc(text, timestamptz)',
+      );
+      await admin.query(`ALTER DATABASE ${databaseName} RESET search_path`);
+    }
+  }
 });

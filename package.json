@@ -9,7 +9,7 @@
   "scripts": {
     "lint": "eslint . && prettier --check .",
     "typecheck": "pnpm --filter \"./apps/*\" --filter \"./packages/*\" typecheck",
-    "test": "pnpm --filter \"./apps/*\" --filter \"./packages/*\" test",
+    "test": "pnpm --filter @switchboard/shared build && pnpm --filter \"./apps/*\" --filter \"./packages/*\" test",
     "build": "pnpm --filter \"./apps/*\" --filter \"./packages/*\" build"
   },
   "devDependencies": {
