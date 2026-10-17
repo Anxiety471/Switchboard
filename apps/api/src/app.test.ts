@@ -1,4 +1,4 @@
-import { connect, createServer, type Server } from 'node:net';
+import { connect, createServer, type Server, type Socket } from 'node:net';
 import { Client } from 'pg';
 import { afterAll, expect, test } from 'vitest';
 import { buildApp, parseHost, parsePort } from './app.js';
@@ -60,13 +60,65 @@ test('GET /health returns 503 when postgres is unreachable', async () => {
     });
     const agentsBody = await agents.text();
     expect(agents.status).toBe(503);
-    expect(agentsBody).toBe('{"ok":false}');
+    expect(agentsBody).toBe('{"error":"database_unavailable"}');
     expect(agentsBody).not.toMatch(
       /ECONNREFUSED|switchboard_user|s3cret-pass|unreachable_test|not-a-real-token/,
     );
     expect(down.server.listening).toBe(true);
+
+    const registered = await fetch(`${address}/agents`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'alpha' }),
+    });
+    const registeredBody = await registered.text();
+    expect(registered.status).toBe(503);
+    expect(registeredBody).toBe('{"error":"database_unavailable"}');
+    expect(registeredBody).not.toMatch(
+      /ECONNREFUSED|switchboard_user|s3cret-pass|unreachable_test/,
+    );
   } finally {
     await down.close();
+  }
+});
+
+test('GET /agents returns 503 when postgres accepts and never replies', async () => {
+  const sockets = new Set<Socket>();
+  const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.on('error', () => undefined);
+    socket.on('close', () => {
+      sockets.delete(socket);
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => resolve());
+  });
+  const listening = server.address();
+  if (listening === null || typeof listening === 'string') {
+    throw new Error('expected a port');
+  }
+  const hung = buildApp(
+    `postgres://switchboard_user:s3cret-pass@127.0.0.1:${listening.port}/hung_test?sslmode=disable`,
+  );
+
+  try {
+    const address = await hung.listen({ host: '127.0.0.1', port: 0 });
+    const agents = await fetch(`${address}/agents`, {
+      headers: { authorization: 'Bearer not-a-real-token' },
+    });
+    const body = await agents.text();
+    expect(agents.status).toBe(503);
+    expect(body).toBe('{"error":"database_unavailable"}');
+    expect(body).not.toMatch(/s3cret-pass|hung_test|timeout|terminated/i);
+    expect(hung.server.listening).toBe(true);
+  } finally {
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    await hung.close();
+    await closeServer(server);
   }
 });
 
@@ -90,7 +142,7 @@ test('the same process recovers after postgres returns', async () => {
       headers: { authorization: 'Bearer not-a-real-token' },
     });
     expect(agents.status).toBe(503);
-    expect(await agents.text()).toBe('{"ok":false}');
+    expect(await agents.text()).toBe('{"error":"database_unavailable"}');
     expect(recovering.server.listening).toBe(true);
 
     forwarder = await forwardTo(

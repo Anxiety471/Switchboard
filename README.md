@@ -12,6 +12,8 @@ Copy `.env.example` to `.env`.
 - `PORT` — port the API binds to. Defaults to `3001`.
 - `REGISTRATION_SECRET` — optional. When set, `POST /agents` requires header `x-registration-secret` to match.
 
+`GET /health` returns `{ "ok": true }`, or `503` with `{ "ok": false }` while Postgres is unreachable. Every other route returns `503` with `{ "error": "database_unavailable" }` in that case.
+
 ## Develop
 
 ```bash

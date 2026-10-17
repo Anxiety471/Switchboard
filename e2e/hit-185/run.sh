@@ -3,7 +3,8 @@
 #
 # Required environment:
 #   SWITCHBOARD_ROOT      directory that contains apps/api/dist/index.js
-#   TEST_DATABASE_URL     Postgres URL for the API under test
+#   TEST_DATABASE_URL     Postgres URL for the API under test.
+#                         The database name must end in _test.
 #   DOWN_DATABASE_URL     Postgres URL that does not accept connections
 #   E2E_DIR               directory for e2e-run.log and scratch files
 #   REGISTRATION_SECRET   value sent as x-registration-secret
@@ -59,6 +60,21 @@ trap cleanup EXIT
 rm -f "$MID_MARKER" "$DONE_MARKER" "$API_LOG" "$DOWN_LOG"
 
 echo "== Switchboard API =="
+db_name=$(TEST_DATABASE_URL="$TEST_DATABASE_URL" python3 - <<'PY'
+import os
+from urllib.parse import unquote, urlparse
+
+name = unquote(urlparse(os.environ["TEST_DATABASE_URL"]).path.lstrip("/"))
+print(name)
+PY
+)
+case "$db_name" in
+  *_test) ;;
+  *)
+    echo "Refusing to run against database ${db_name}; the name must end in _test" >&2
+    exit 1
+    ;;
+esac
 psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -c "TRUNCATE agents CASCADE"
 
 env -u HOST \

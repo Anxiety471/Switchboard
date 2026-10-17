@@ -20,6 +20,7 @@ const MAX_INBOX_LIMIT = 200;
 const ONLINE_INTERVAL = '60 seconds';
 const MIGRATION_RETRY_MIN_MS = 200;
 const MIGRATION_RETRY_MAX_MS = 5000;
+const DATABASE_TIMEOUT_MS = 2000;
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const UUID_PATTERN =
   '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';
@@ -34,7 +35,6 @@ const REDACT_PATHS = [
   'headers["x-registration-secret"]',
 ];
 
-const NAME_CONFLICTS = new Set(['agents_name_unique', 'agents_name_lower_idx']);
 const CONNECTION_ERRORS = new Set([
   'ECONNREFUSED',
   'ECONNRESET',
@@ -53,6 +53,15 @@ const CONNECTION_ERRORS = new Set([
   '57P02',
   '57P03',
 ]);
+const UNAVAILABLE_MESSAGES = [
+  'timeout exceeded when trying to connect',
+  'timeout expired',
+  'connection terminated',
+  'query read timeout',
+  'server closed the connection unexpectedly',
+  'the database system is shutting down',
+  'the database system is starting up',
+];
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -233,17 +242,32 @@ function parseCursor(
 }
 
 function isDatabaseUnavailable(error: unknown): boolean {
-  if (typeof error !== 'object' || error === null || !('code' in error)) {
+  if (typeof error !== 'object' || error === null) {
     return false;
   }
-  const code = error.code;
-  if (typeof code === 'string' && CONNECTION_ERRORS.has(code)) {
-    return true;
+  if ('code' in error) {
+    const code = error.code;
+    if (typeof code === 'string' && CONNECTION_ERRORS.has(code)) {
+      return true;
+    }
+  }
+  if ('message' in error && typeof error.message === 'string') {
+    const message = error.message.toLowerCase();
+    if (UNAVAILABLE_MESSAGES.some((part) => message.includes(part))) {
+      return true;
+    }
   }
   if ('errors' in error && Array.isArray(error.errors)) {
     return error.errors.some((item) => isDatabaseUnavailable(item));
   }
+  if ('cause' in error && error.cause !== undefined && error.cause !== error) {
+    return isDatabaseUnavailable(error.cause);
+  }
   return false;
+}
+
+function databaseUnavailableBody(): { error: 'database_unavailable' } {
+  return { error: 'database_unavailable' };
 }
 
 function registrationHeader(headers: IncomingHttpHeaders): string {
@@ -254,7 +278,9 @@ function registrationHeader(headers: IncomingHttpHeaders): string {
 export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
   const pool = new Pool({
     connectionString: databaseUrl,
-    connectionTimeoutMillis: 2000,
+    connectionTimeoutMillis: DATABASE_TIMEOUT_MS,
+    query_timeout: DATABASE_TIMEOUT_MS,
+    statement_timeout: DATABASE_TIMEOUT_MS,
     max: options?.max ?? 10,
   });
   const logging = options?.logger === true || options?.logStream !== undefined;
@@ -357,6 +383,10 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
   app.setSchemaErrorFormatter(() => new Error('invalid request'));
 
   app.setErrorHandler((error, _request, reply) => {
+    if (isDatabaseUnavailable(error)) {
+      app.log.error({ err: error }, 'database unavailable');
+      return reply.code(503).send(databaseUnavailableBody());
+    }
     const statusCode = statusCodeOf(error);
     if (isValidationError(error) || statusCode === 400 || statusCode === 413) {
       const code = statusCode === 413 ? 413 : 400;
@@ -411,7 +441,7 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
     } catch (error) {
       if (isDatabaseUnavailable(error)) {
         app.log.error({ err: error }, 'database auth check failed');
-        return reply.code(503).send({ ok: false });
+        return reply.code(503).send(databaseUnavailableBody());
       }
       throw error;
     }
@@ -490,13 +520,15 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
         };
         return reply.code(201).send(body);
       } catch (error) {
-        const constraint = pgField(error, 'constraint');
         if (
           pgField(error, 'code') === '23505' &&
-          constraint !== undefined &&
-          NAME_CONFLICTS.has(constraint)
+          pgField(error, 'constraint') === 'agents_name_lower_idx'
         ) {
           return reply.code(409).send({ error: 'name already registered' });
+        }
+        if (isDatabaseUnavailable(error)) {
+          app.log.error({ err: error }, 'database unavailable');
+          return reply.code(503).send(databaseUnavailableBody());
         }
         throw error;
       }
