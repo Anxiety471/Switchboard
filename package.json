@@ -1,0 +1,23 @@
+{
+  "name": "switchboard",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.33.4",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "lint": "eslint . && prettier --check .",
+    "typecheck": "pnpm --filter \"./apps/*\" --filter \"./packages/*\" typecheck",
+    "test": "pnpm --filter \"./apps/*\" --filter \"./packages/*\" test",
+    "build": "pnpm --filter \"./apps/*\" --filter \"./packages/*\" build"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.13.0",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.9.10",
+    "typescript": "catalog:",
+    "typescript-eslint": "^8.71.2"
+  }
+}
