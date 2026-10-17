@@ -129,6 +129,7 @@ function input(
     sessionId: undefined,
     tokenCookie: undefined,
     clientKey: 'client-a',
+    wrongGuessDelayMs: 0,
     directory,
     ...extra,
   };
@@ -349,11 +350,11 @@ test('repeated login failures are limited and do not grow a notice store', async
   expect(windowed.session).toBeDefined();
 });
 
-test('an unknown address still accepts the correct key after shared wrong guesses', async () => {
+test('without a client address there is no rate limit', async () => {
   const directory = memoryDirectory();
   const csrf = issueFormCsrf(SECRET);
   const wrong = fields({ intent: 'login', password: 'nope', csrf });
-  for (let attempt = 0; attempt < 8; attempt += 1) {
+  for (let attempt = 0; attempt < 9; attempt += 1) {
     const denied = await handleDeskForm(
       wrong,
       input(directory, { clientKey: undefined }),
@@ -370,35 +371,40 @@ test('an unknown address still accepts the correct key after shared wrong guesse
   );
   expect(opened).toMatchObject({ kind: 'redirect', location: '/' });
   expect(directory.session).toBeDefined();
+});
 
-  const other = memoryDirectory();
-  const ninth = await handleDeskForm(
-    wrong,
-    input(other, { clientKey: undefined }),
+test('parallel wrong guesses do not delay a correct login', async () => {
+  const directory = memoryDirectory();
+  const csrf = issueFormCsrf(SECRET);
+  const started = performance.now();
+  const wrongs = Array.from({ length: 8 }, (_value, index) =>
+    handleDeskForm(
+      fields({ intent: 'login', password: 'nope', csrf }),
+      input(directory, {
+        clientKey: `parallel-${index}`,
+        wrongGuessDelayMs: 500,
+      }),
+    ),
   );
-  expect(ninth).toEqual({
-    kind: 'redirect',
-    location: '/?error=limited',
-    cookies: [],
-  });
-  expect(other.session).toBeUndefined();
-
-  const still = await handleDeskForm(
+  const opened = await handleDeskForm(
     fields({ intent: 'login', password: SECRET, csrf }),
-    input(other, { clientKey: undefined }),
+    input(directory, {
+      clientKey: 'parallel-ok',
+      wrongGuessDelayMs: 500,
+    }),
   );
-  expect(still).toMatchObject({ kind: 'redirect', location: '/' });
-  expect(other.session).toBeDefined();
+  expect(performance.now() - started).toBeLessThan(400);
+  expect(opened).toMatchObject({ kind: 'redirect', location: '/' });
+  expect(directory.session).toBeDefined();
 
-  const after = await handleDeskForm(
-    wrong,
-    input(memoryDirectory(), { clientKey: undefined }),
-  );
-  expect(after).toEqual({
-    kind: 'redirect',
-    location: '/?error=limited',
-    cookies: [],
-  });
+  const denied = await Promise.all(wrongs);
+  expect(performance.now() - started).toBeGreaterThanOrEqual(450);
+  for (const result of denied) {
+    expect(result).toMatchObject({
+      kind: 'redirect',
+      location: '/?error=unauthorized',
+    });
+  }
 });
 
 test('register, issue, and revoke require the session csrf token', async () => {

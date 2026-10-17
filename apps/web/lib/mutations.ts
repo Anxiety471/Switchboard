@@ -101,6 +101,7 @@ export type DeskFormInput = {
   tokenCookie: string | undefined;
   clientKey: string | undefined;
   now?: number;
+  wrongGuessDelayMs?: number;
   writes?: LedgerWrites;
   directory?: DeskDirectory;
 };
@@ -113,7 +114,16 @@ function status(code: 400 | 403): DeskAction {
   return { kind: 'status', status: code };
 }
 
-const SHARED_LOGIN_KEY = 'shared';
+export const WRONG_GUESS_DELAY_MS = 500;
+
+function wait(ms: number): Promise<void> {
+  if (ms <= 0) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
 
 function isAction(value: { id: string } | DeskAction): value is DeskAction {
   return 'kind' in value;
@@ -227,15 +237,18 @@ export async function handleDeskForm(
     const presented = typeof password === 'string' ? password : '';
     const accepted = secretsEqual(config.secret, presented);
     const clientKey = input.clientKey;
+    const delayMs = input.wrongGuessDelayMs ?? WRONG_GUESS_DELAY_MS;
     if (clientKey !== undefined && loginLimited(clientKey, now)) {
+      if (!accepted) {
+        await wait(delayMs);
+      }
       return redirect('/?error=limited');
     }
     if (!accepted) {
-      const bucket = clientKey ?? SHARED_LOGIN_KEY;
-      if (loginLimited(bucket, now)) {
-        return redirect('/?error=limited');
+      if (clientKey !== undefined) {
+        noteLoginFailure(clientKey, now);
       }
-      noteLoginFailure(bucket, now);
+      await wait(delayMs);
       return redirect('/?error=unauthorized');
     }
     const opened = await directory.openSession(config);

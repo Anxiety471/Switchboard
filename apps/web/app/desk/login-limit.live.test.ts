@@ -236,6 +236,7 @@ async function startDesk(options: {
     NEXT_TELEMETRY_DISABLED: '1',
   };
   delete env.COOKIE_SECURE;
+  delete env.TRUST_PROXY_HOPS;
   if (options.trustProxy) {
     env.TRUST_PROXY = '1';
   } else {
@@ -310,7 +311,7 @@ afterAll(async () => {
   }
 });
 
-test('a real desk keeps the correct key available when it cannot see a client address', async () => {
+test('a real desk rates logins by the proxy hop and delays only a wrong key', async () => {
   let sessions = 0;
   const api = await listen((incoming, response) => {
     if (incoming.headers['x-dashboard-secret'] !== SECRET) {
@@ -329,42 +330,46 @@ test('a real desk keeps the correct key available when it cannot see a client ad
 
   const open = await startDesk({ apiUrl: api.url, trustProxy: false });
   const csrf = await loginCsrf(open.port);
-  for (let attempt = 0; attempt < 8; attempt += 1) {
-    const denied = await postLogin({
+  const started = Date.now();
+  const wrongs = Array.from({ length: 8 }, () =>
+    postLogin({
       port: open.port,
       localAddress: '127.0.0.1',
       password: 'nope',
       csrf,
-      forwardedFor: '127.0.0.1',
-    });
-    expect(denied.status).toBe(303);
-    expect(denied.location).toBe('/?error=unauthorized');
-  }
-
+      forwardedFor: '198.51.100.9',
+    }),
+  );
   const signedIn = await postLogin({
     port: open.port,
     localAddress: '127.0.0.2',
     password: SECRET,
     csrf,
-    forwardedFor: '127.0.0.2',
+    forwardedFor: '198.51.100.8',
   });
+  expect(Date.now() - started).toBeLessThan(450);
   expect(signedIn.status).toBe(303);
   expect(signedIn.location).toBe('/');
   expect(signedIn.setCookie.join('\n')).toContain(
     `switchboard_desk=${SESSION_ID}`,
   );
   expect(sessions).toBe(1);
+  const denied = await Promise.all(wrongs);
+  expect(Date.now() - started).toBeGreaterThanOrEqual(450);
+  for (const attempt of denied) {
+    expect(attempt.status).toBe(303);
+    expect(attempt.location).toBe('/?error=unauthorized');
+  }
 
-  const ninth = await postLogin({
+  const again = await postLogin({
     port: open.port,
     localAddress: '127.0.0.1',
     password: 'nope',
     csrf,
-    forwardedFor: '127.0.0.1',
+    forwardedFor: '198.51.100.9',
   });
-  expect(ninth.status).toBe(303);
-  expect(ninth.location).toBe('/?error=limited');
-  expect(ninth.setCookie.join('\n')).not.toContain('switchboard_desk=');
+  expect(again.status).toBe(303);
+  expect(again.location).toBe('/?error=unauthorized');
   expect(sessions).toBe(1);
 
   const page = await httpExchange({
@@ -387,22 +392,22 @@ test('a real desk keeps the correct key available when it cannot see a client ad
       localAddress: '127.0.0.1',
       password: 'nope',
       csrf: proxyCsrf,
-      forwardedFor: '203.0.113.10',
+      forwardedFor: '203.0.113.20, 203.0.113.10',
     });
     expect(denied.status).toBe(303);
     expect(denied.location).toBe('/?error=unauthorized');
   }
 
-  const locked = await postLogin({
+  const spoofed = await postLogin({
     port: proxied.port,
     localAddress: '127.0.0.1',
     password: SECRET,
     csrf: proxyCsrf,
-    forwardedFor: '203.0.113.10',
+    forwardedFor: '198.51.100.9, 203.0.113.10',
   });
-  expect(locked.status).toBe(303);
-  expect(locked.location).toBe('/?error=limited');
-  expect(locked.setCookie.join('\n')).not.toContain('switchboard_desk=');
+  expect(spoofed.status).toBe(303);
+  expect(spoofed.location).toBe('/?error=limited');
+  expect(spoofed.setCookie.join('\n')).not.toContain('switchboard_desk=');
   expect(sessions).toBe(0);
 
   const other = await postLogin({
@@ -410,7 +415,7 @@ test('a real desk keeps the correct key available when it cannot see a client ad
     localAddress: '127.0.0.2',
     password: SECRET,
     csrf: proxyCsrf,
-    forwardedFor: '203.0.113.20',
+    forwardedFor: '203.0.113.10, 203.0.113.20',
   });
   expect(other.status).toBe(303);
   expect(other.location).toBe('/');
@@ -424,7 +429,7 @@ test('a real desk keeps the correct key available when it cannot see a client ad
     localAddress: '127.0.0.2',
     password: 'nope',
     csrf: proxyCsrf,
-    forwardedFor: '203.0.113.20',
+    forwardedFor: '203.0.113.10, 203.0.113.20',
   });
   expect(otherWrong.status).toBe(303);
   expect(otherWrong.location).toBe('/?error=unauthorized');
@@ -434,8 +439,8 @@ test('a real desk keeps the correct key available when it cannot see a client ad
     localAddress: '127.0.0.1',
     password: SECRET,
     csrf: proxyCsrf,
-    forwardedFor: '203.0.113.10',
+    forwardedFor: '203.0.113.99, 203.0.113.10',
   });
   expect(stillLocked.status).toBe(303);
   expect(stillLocked.location).toBe('/?error=limited');
-}, 60_000);
+}, 120_000);

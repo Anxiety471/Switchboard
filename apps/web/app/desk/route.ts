@@ -1,5 +1,9 @@
 import { DESK_COOKIE, TOKEN_COOKIE } from '../../lib/desk';
-import { deskClientKey, trustProxyEnabled } from '../../lib/login-limit';
+import {
+  deskClientKey,
+  proxyHops,
+  trustProxyEnabled,
+} from '../../lib/login-limit';
 import { handleDeskForm } from '../../lib/mutations';
 
 export const dynamic = 'force-dynamic';
@@ -26,6 +30,7 @@ export async function POST(request: Request): Promise<Response> {
     clientKey: deskClientKey({
       forwardedFor: request.headers.get('x-forwarded-for'),
       trustProxy: trustProxyEnabled(envValue('TRUST_PROXY')),
+      hops: proxyHops(envValue('TRUST_PROXY_HOPS')),
     }),
   });
   if (action.kind === 'status') {
