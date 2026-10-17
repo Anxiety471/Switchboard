@@ -4,7 +4,8 @@
     "noEmit": true,
     "declaration": false,
     "declarationMap": false,
-    "rootDir": "src",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
     "types": ["node"]
   },
   "include": ["src/**/*.ts"]

@@ -2,13 +2,16 @@
   "name": "@switchboard/web",
   "version": "0.0.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "build": "next build",
-    "start": "next start",
+    "dev": "next dev -H 127.0.0.1 -p 3000",
+    "start": "next start -H 127.0.0.1 -p 3000",
     "typecheck": "next typegen && tsc --noEmit",
     "test": "vitest run"
   },
   "dependencies": {
+    "@switchboard/shared": "workspace:*",
     "next": "^16.4.2",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"

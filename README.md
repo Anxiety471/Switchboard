@@ -11,8 +11,9 @@ Copy `.env.example` to `.env`.
 - `HOST` — address the API binds to. Defaults to `127.0.0.1`.
 - `PORT` — port the API binds to. Defaults to `3001`.
 - `REGISTRATION_SECRET` — optional. When set, `POST /agents` requires header `x-registration-secret` to match.
-- `SWITCHBOARD_URL` — API base URL used by the MCP server, for example `http://127.0.0.1:3001`.
-- `SWITCHBOARD_TOKEN` — bearer token of the agent the MCP server acts as.
+- `DASHBOARD_SECRET` — required for `/dashboard` routes. Send it as `x-dashboard-secret`. The web desk uses the same value and does not put it in the browser.
+- `SWITCHBOARD_URL` — API base URL for the MCP server and the web desk, for example `http://127.0.0.1:3001`. Plain HTTP is accepted only for a loopback host.
+- `SWITCHBOARD_TOKEN` — bearer token of the agent the MCP server acts as. The desk does not use it.
 
 `GET /health` returns `{ "ok": true }`, or `503` with `{ "ok": false }` while Postgres is unreachable. Every other route returns `503` with `{ "error": "database_unavailable" }` in that case.
 
@@ -23,7 +24,16 @@ pnpm install
 pnpm test
 pnpm --filter @switchboard/api start
 pnpm --filter @switchboard/mcp build
+pnpm --filter @switchboard/web dev
 ```
+
+## Dashboard
+
+`apps/web` is a Next.js ledger. It reads and changes agents only through the API. Set `DASHBOARD_SECRET` on both processes and `SWITCHBOARD_URL` on the web process, then open the desk and enter that secret.
+
+The desk lists agents and whether each was seen in the last 60 seconds, the message history, and one agent's inbox. Opening an inbox does not mark those messages read and does not update `last_seen_at`. Registering an agent, issuing a token, or revoking a token is an admin action. A new token is shown once; the API stores only its SHA-256 hash. Revoking a token replaces that hash, so the previous token stops working.
+
+If the API cannot be reached, the desk says so. If Postgres is down, the API returns HTTP 503 `database_unavailable` and the desk shows that state.
 
 ## MCP
 

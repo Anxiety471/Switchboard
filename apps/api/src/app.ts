@@ -3,20 +3,20 @@ import Fastify, { type FastifyError } from 'fastify';
 import { Pool, type PoolClient } from 'pg';
 import type {
   AgentSummary,
-  InboxMessage,
-  InboxPage,
   ReadReceipt,
   RegisteredAgent,
   SentMessage,
 } from '@switchboard/shared';
+import { registerDashboardRoutes } from './dashboard.js';
+import { readInbox } from './inbox-read.js';
 import { migrate } from './migrate.js';
+import { inboxLimit, parseCursor, UUID_PATTERN } from './paging.js';
+import { isoTime } from './time.js';
 import { generateToken, hashToken, secretsEqual } from './token.js';
 
 const BODY_LIMIT = 32 * 1024;
 const MAX_BODY_BYTES = 8192;
 const MAX_READ_IDS = 100;
-const DEFAULT_INBOX_LIMIT = 50;
-const MAX_INBOX_LIMIT = 200;
 const ONLINE_INTERVAL = '60 seconds';
 const MIGRATION_RETRY_MIN_MS = 200;
 const MIGRATION_RETRY_MAX_MS = 5000;
@@ -25,17 +25,15 @@ const STATEMENT_TIMEOUT_MS = 2000;
 const QUERY_TIMEOUT_MS = 2500;
 const KEEPALIVE_INITIAL_DELAY_MS = 10_000;
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
-const UUID_PATTERN =
-  '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';
-const CURSOR_PATTERN =
-  /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\|([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$/;
 
 const REDACT_PATHS = [
   'req.headers.authorization',
   'req.headers.Authorization',
   'req.headers["x-registration-secret"]',
+  'req.headers["x-dashboard-secret"]',
   'headers.authorization',
   'headers["x-registration-secret"]',
+  'headers["x-dashboard-secret"]',
 ];
 
 const CONNECTION_ERRORS = new Set([
@@ -83,6 +81,7 @@ export type BuildAppOptions = {
   migrate?: boolean;
   logStream?: { write: (message: string) => void };
   registrationSecret?: string;
+  dashboardSecret?: string;
 };
 
 type AuthenticatedAgent = {
@@ -109,11 +108,6 @@ type InboxQuery = {
   after?: string;
 };
 
-type InboxCursor = {
-  createdAt: string;
-  id: string;
-};
-
 function requestPath(url: string): string {
   const query = url.indexOf('?');
   return query === -1 ? url : url.slice(0, query);
@@ -135,7 +129,9 @@ function headersForLog(headers: IncomingHttpHeaders): Record<string, unknown> {
     }
     const name = key.toLowerCase();
     copy[key] =
-      name === 'authorization' || name === 'x-registration-secret'
+      name === 'authorization' ||
+      name === 'x-registration-secret' ||
+      name === 'x-dashboard-secret'
         ? '[Redacted]'
         : value;
   }
@@ -188,16 +184,6 @@ function requiredRow<T>(rows: readonly T[]): T {
   return row;
 }
 
-function isoTime(value: Date | string | null): string | null {
-  if (value === null) {
-    return null;
-  }
-  if (value instanceof Date) {
-    return value.toISOString();
-  }
-  return new Date(value).toISOString();
-}
-
 function caller(request: {
   agent: AuthenticatedAgent | null;
 }): AuthenticatedAgent {
@@ -205,44 +191,6 @@ function caller(request: {
     throw new Error('missing authenticated agent');
   }
   return request.agent;
-}
-
-function inboxLimit(value: string | undefined): number | undefined {
-  if (value === undefined) {
-    return DEFAULT_INBOX_LIMIT;
-  }
-  if (!/^[1-9]\d{0,2}$/.test(value)) {
-    return undefined;
-  }
-  const parsed = Number(value);
-  if (parsed > MAX_INBOX_LIMIT) {
-    return undefined;
-  }
-  return parsed;
-}
-
-function isCursorTime(value: string): boolean {
-  const year = Number(value.slice(0, 4));
-  if (!Number.isInteger(year) || year < 1 || year > 9999) {
-    return false;
-  }
-  const parsed = new Date(value);
-  return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
-}
-
-function parseCursor(
-  value: string | undefined,
-): InboxCursor | null | undefined {
-  if (value === undefined) {
-    return null;
-  }
-  const match = CURSOR_PATTERN.exec(value);
-  const createdAt = match?.[1];
-  const id = match?.[2];
-  if (createdAt === undefined || id === undefined || !isCursorTime(createdAt)) {
-    return undefined;
-  }
-  return { createdAt, id };
 }
 
 function unavailableMessage(error: object): boolean {
@@ -293,6 +241,16 @@ function registrationHeader(headers: IncomingHttpHeaders): string {
   return typeof header === 'string' ? header : '';
 }
 
+function dashboardHeader(headers: IncomingHttpHeaders): string {
+  const header = headers['x-dashboard-secret'];
+  return typeof header === 'string' ? header : '';
+}
+
+function isDashboardPath(url: string): boolean {
+  const path = requestPath(url);
+  return path === '/dashboard' || path.startsWith('/dashboard/');
+}
+
 export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
   const pool = new Pool({
     connectionString: databaseUrl,
@@ -305,6 +263,7 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
   });
   const logging = options?.logger === true || options?.logStream !== undefined;
   const registrationSecret = options?.registrationSecret;
+  const dashboardSecret = options?.dashboardSecret;
   let migrated = options?.migrate === false;
   let migrationStopped = false;
   let wake: (() => void) | undefined;
@@ -444,6 +403,16 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
     if (isPublicRoute(request.method, request.url)) {
       return;
     }
+    if (isDashboardPath(request.url)) {
+      if (
+        dashboardSecret === undefined ||
+        dashboardSecret === '' ||
+        !secretsEqual(dashboardSecret, dashboardHeader(request.headers))
+      ) {
+        return reply.code(401).send({ error: 'unauthorized' });
+      }
+      return;
+    }
     const token = bearerToken(request.headers.authorization);
     if (token === undefined) {
       return reply.code(401).send({ error: 'unauthorized' });
@@ -455,6 +424,7 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
          UPDATE agents
          SET last_seen_at = clock_timestamp()
          WHERE token_hash = $1
+           AND token_revoked = false
            AND (
              last_seen_at IS NULL
              OR last_seen_at < clock_timestamp() - interval '10 seconds'
@@ -462,7 +432,8 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
        )
        SELECT id, name
        FROM agents
-       WHERE token_hash = $1`,
+       WHERE token_hash = $1
+         AND token_revoked = false`,
         [hashToken(token)],
       );
     } catch (error) {
@@ -741,64 +712,11 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
       if (limit === undefined || cursor === undefined) {
         return reply.code(400).send({ error: 'invalid request' });
       }
-      const unreadOnly = request.query.unread === 'true';
-      const result = await pool.query<{
-        id: string;
-        from_name: string;
-        to_name: string;
-        body: string;
-        created_at: Date | string;
-        read_at: Date | string | null;
-      }>(
-        `SELECT m.id,
-                sender.name AS from_name,
-                CASE
-                  WHEN m.to_agent IS NULL THEN '*'
-                  ELSE recipient.name
-                END AS to_name,
-                m.body,
-                date_trunc('milliseconds', m.created_at) AS created_at,
-                r.read_at
-         FROM message_receipts r
-         JOIN messages m ON m.id = r.message_id
-         JOIN agents sender ON sender.id = m.from_agent
-         JOIN agents recipient ON recipient.id = r.agent_id
-         WHERE r.agent_id = $1::uuid
-           AND ($2::boolean = false OR r.read_at IS NULL)
-           AND (
-             $3::timestamptz IS NULL
-             OR (
-               date_trunc('milliseconds', m.created_at),
-               m.id
-             ) > ($3::timestamptz, $4::uuid)
-           )
-         ORDER BY date_trunc('milliseconds', m.created_at) ASC, m.id ASC
-         LIMIT $5`,
-        [
-          agent.id,
-          unreadOnly,
-          cursor?.createdAt ?? null,
-          cursor?.id ?? null,
-          limit + 1,
-        ],
-      );
-      const hasMore = result.rows.length > limit;
-      const pageRows = hasMore ? result.rows.slice(0, limit) : result.rows;
-      const messages: InboxMessage[] = pageRows.map((row) => ({
-        id: row.id,
-        from: row.from_name,
-        to: row.to_name,
-        body: row.body,
-        createdAt: isoTime(row.created_at) ?? '',
-        readAt: isoTime(row.read_at),
-      }));
-      const last = messages[messages.length - 1];
-      const page: InboxPage = {
-        messages,
-        next:
-          hasMore && last !== undefined ? `${last.createdAt}|${last.id}` : null,
-      };
-      return page;
+      return readInbox(pool, agent.id, {
+        unreadOnly: request.query.unread === 'true',
+        cursor,
+        limit,
+      });
     },
   );
 
@@ -860,6 +778,8 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
       return body;
     },
   );
+
+  registerDashboardRoutes(app, pool, ONLINE_INTERVAL);
 
   const migrationTask = runMigrations();
 
