@@ -157,22 +157,106 @@ export function proxyHops(value: string | undefined): number {
   return parsed;
 }
 
-function ipv6Prefix(address: string): string | undefined {
+const UNPARSED_CLIENT_KEY = 'fwd:unparsed';
+
+function parseIpv4(value: string): string | undefined {
+  const parts = value.split('.');
+  if (parts.length !== 4) {
+    return undefined;
+  }
+  const octets: number[] = [];
+  for (const part of parts) {
+    if (!/^\d{1,3}$/.test(part)) {
+      return undefined;
+    }
+    const octet = Number(part);
+    if (octet > 255) {
+      return undefined;
+    }
+    octets.push(octet);
+  }
+  return octets.join('.');
+}
+
+function stripZone(value: string): string {
+  const zone = value.indexOf('%');
+  return zone === -1 ? value : value.slice(0, zone);
+}
+
+function portValue(text: string): number | undefined {
+  if (!/^\d{1,5}$/.test(text)) {
+    return undefined;
+  }
+  const port = Number(text);
+  if (port > 65535) {
+    return undefined;
+  }
+  return port;
+}
+
+function unwrapForwarded(raw: string): string | undefined {
+  const trimmed = raw.trim();
+  if (trimmed === '') {
+    return undefined;
+  }
+  if (trimmed.startsWith('[')) {
+    const end = trimmed.indexOf(']');
+    if (end < 2) {
+      return undefined;
+    }
+    const rest = trimmed.slice(end + 1);
+    if (rest !== '' && portValue(rest.slice(1)) === undefined) {
+      return undefined;
+    }
+    if (rest !== '' && !rest.startsWith(':')) {
+      return undefined;
+    }
+    return stripZone(trimmed.slice(1, end));
+  }
+  const value = stripZone(trimmed);
+  const colon = value.lastIndexOf(':');
+  if (colon > 0 && value.indexOf(':') === colon) {
+    const host = parseIpv4(value.slice(0, colon));
+    const port = portValue(value.slice(colon + 1));
+    if (host !== undefined && port !== undefined) {
+      return host;
+    }
+  }
+  return value;
+}
+
+function expandSide(side: string): string[] | undefined {
+  if (side === '') {
+    return [];
+  }
+  const groups = side.split(':');
+  if (groups.some((group) => group === '')) {
+    return undefined;
+  }
+  const last = groups[groups.length - 1];
+  if (last === undefined || !last.includes('.')) {
+    return groups;
+  }
+  const ipv4 = parseIpv4(last);
+  if (ipv4 === undefined) {
+    return undefined;
+  }
+  const octets = ipv4.split('.').map((part) => Number(part));
+  const first = octets[0] ?? 0;
+  const second = octets[1] ?? 0;
+  const third = octets[2] ?? 0;
+  const fourth = octets[3] ?? 0;
+  const high = ((first << 8) | second).toString(16);
+  const low = ((third << 8) | fourth).toString(16);
+  return [...groups.slice(0, -1), high, low];
+}
+
+function ipv6Bucket(address: string): string | undefined {
   const halves = address.toLowerCase().split('::');
   if (halves.length > 2) {
     return undefined;
   }
-  const parseSide = (side: string): string[] | undefined => {
-    if (side === '') {
-      return [];
-    }
-    const groups = side.split(':');
-    if (groups.some((group) => group === '')) {
-      return undefined;
-    }
-    return groups;
-  };
-  const head = parseSide(halves[0] ?? '');
+  const head = expandSide(halves[0] ?? '');
   if (head === undefined) {
     return undefined;
   }
@@ -180,7 +264,7 @@ function ipv6Prefix(address: string): string | undefined {
   if (halves.length === 1) {
     groups = head;
   } else {
-    const tail = parseSide(halves[1] ?? '');
+    const tail = expandSide(halves[1] ?? '');
     if (tail === undefined) {
       return undefined;
     }
@@ -200,17 +284,34 @@ function ipv6Prefix(address: string): string | undefined {
     }
     parsed.push(Number.parseInt(group, 16));
   }
+  const mapped =
+    parsed[0] === 0 &&
+    parsed[1] === 0 &&
+    parsed[2] === 0 &&
+    parsed[3] === 0 &&
+    parsed[4] === 0 &&
+    parsed[5] === 0xffff;
+  if (mapped) {
+    const high = parsed[6] ?? 0;
+    const low = parsed[7] ?? 0;
+    return [high >> 8, high & 0xff, low >> 8, low & 0xff].join('.');
+  }
   return parsed
     .slice(0, 4)
     .map((value) => value.toString(16))
     .join(':');
 }
 
-function bucketAddress(address: string): string | undefined {
-  if (!address.includes(':')) {
-    return address;
+function normalizeClientAddress(raw: string): string | undefined {
+  const unwrapped = unwrapForwarded(raw);
+  if (unwrapped === undefined || unwrapped === '') {
+    return undefined;
   }
-  return ipv6Prefix(address);
+  const ipv4 = parseIpv4(unwrapped);
+  if (ipv4 !== undefined) {
+    return ipv4;
+  }
+  return ipv6Bucket(unwrapped);
 }
 
 function forwardedClient(
@@ -227,15 +328,7 @@ function forwardedClient(
       entries.push(trimmed);
     }
   }
-  const chosen = entries[entries.length - hops];
-  if (
-    chosen === undefined ||
-    !/^[0-9A-Za-z:.]+$/.test(chosen) ||
-    chosen.length > 64
-  ) {
-    return undefined;
-  }
-  return chosen;
+  return entries[entries.length - hops];
 }
 
 export function deskClientKey(input: {
@@ -248,11 +341,11 @@ export function deskClientKey(input: {
   }
   const forwarded = forwardedClient(input.forwardedFor, input.hops ?? 1);
   if (forwarded === undefined) {
-    return undefined;
+    return UNPARSED_CLIENT_KEY;
   }
-  const address = bucketAddress(forwarded);
+  const address = normalizeClientAddress(forwarded);
   if (address === undefined) {
-    return undefined;
+    return UNPARSED_CLIENT_KEY;
   }
   return `fwd:${address}`;
 }

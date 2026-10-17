@@ -655,6 +655,69 @@ test('addresses in one IPv6 /64 share one bucket', async () => {
   await stop(desk.child);
 }, 60_000);
 
+test('normalized and unparseable forwarded addresses are limited after eight wrong guesses', async () => {
+  tally.sessions = 0;
+  const apiUrl = await startApi();
+  const desk = await startDesk({ apiUrl, trustProxy: true });
+  const csrf = await loginCsrf(desk.port);
+  const forms = [
+    '::ffff:203.0.113.77',
+    '203.0.113.78:4711',
+    '[2001:db8:9::1]:443',
+    'fe80::1%eth0',
+    'garbage',
+  ];
+  for (let wave = 0; wave < 8; wave += 1) {
+    const denied = await Promise.all(
+      forms.map((forwardedFor) =>
+        postLogin({
+          port: desk.port,
+          localAddress: '127.0.0.1',
+          password: 'nope',
+          csrf,
+          forwardedFor,
+        }),
+      ),
+    );
+    for (const attempt of denied) {
+      expect(attempt.status).toBe(303);
+      expect(attempt.location).toBe('/?error=unauthorized');
+    }
+  }
+  const limited = await Promise.all(
+    forms.map((forwardedFor) =>
+      postLogin({
+        port: desk.port,
+        localAddress: '127.0.0.1',
+        password: 'nope',
+        csrf,
+        forwardedFor,
+      }),
+    ),
+  );
+  for (const attempt of limited) {
+    expect(attempt.status).toBe(303);
+    expect(attempt.location).toBe('/?error=limited');
+    expect(attempt.setCookie.join('\n')).not.toContain('switchboard_desk=');
+  }
+  expect(tally.sessions).toBe(0);
+
+  const other = await postLogin({
+    port: desk.port,
+    localAddress: '127.0.0.1',
+    password: SECRET,
+    csrf,
+    forwardedFor: '198.51.100.40',
+  });
+  expect(other.status).toBe(303);
+  expect(other.location).toBe('/');
+  expect(other.setCookie.join('\n')).toContain(
+    `switchboard_desk=${SESSION_ID}`,
+  );
+  expect(tally.sessions).toBe(1);
+  await stop(desk.child);
+}, 60_000);
+
 test('an invalid TRUST_PROXY_HOPS stops next start with one line', async () => {
   for (const hops of ['0', '-1', '1.5']) {
     const port = await freePort();

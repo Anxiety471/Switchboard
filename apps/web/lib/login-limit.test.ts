@@ -58,16 +58,16 @@ test('a trusted proxy counts the hop from the right', () => {
       trustProxy: true,
       hops: 2,
     }),
-  ).toBeUndefined();
+  ).toBe('fwd:unparsed');
   expect(
     deskClientKey({
       forwardedFor: ' ',
       trustProxy: true,
     }),
-  ).toBeUndefined();
-  expect(
-    deskClientKey({ forwardedFor: null, trustProxy: true }),
-  ).toBeUndefined();
+  ).toBe('fwd:unparsed');
+  expect(deskClientKey({ forwardedFor: null, trustProxy: true })).toBe(
+    'fwd:unparsed',
+  );
 });
 
 test('an invalid hop count prints one line and exits non-zero', () => {
@@ -154,13 +154,81 @@ test('ipv6 clients in one /64 share a bucket key', () => {
       forwardedFor: 'gggg::1',
       trustProxy: true,
     }),
-  ).toBeUndefined();
+  ).toBe('fwd:unparsed');
 
   const now = 1_700_000_000_000;
   const shared = `fwd:${prefix}`;
   lock(shared, now);
   expect(loginLimited(shared, now)).toBe(true);
   expect(loginLimited('fwd:2001:db8:1:3', now)).toBe(false);
+});
+
+test('forwarded addresses are normalized and unparseable ones share a bucket', () => {
+  expect(
+    deskClientKey({
+      forwardedFor: '::ffff:203.0.113.77',
+      trustProxy: true,
+    }),
+  ).toBe('fwd:203.0.113.77');
+  expect(
+    deskClientKey({
+      forwardedFor: '::FFFF:cb00:714d',
+      trustProxy: true,
+    }),
+  ).toBe('fwd:203.0.113.77');
+  expect(
+    deskClientKey({
+      forwardedFor: '0:0:0:0:0:ffff:203.0.113.77',
+      trustProxy: true,
+    }),
+  ).toBe('fwd:203.0.113.77');
+  expect(
+    deskClientKey({
+      forwardedFor: '203.0.113.78:4711',
+      trustProxy: true,
+    }),
+  ).toBe('fwd:203.0.113.78');
+  expect(
+    deskClientKey({
+      forwardedFor: '[2001:db8:9::1]:443',
+      trustProxy: true,
+    }),
+  ).toBe('fwd:2001:db8:9:0');
+  expect(
+    deskClientKey({
+      forwardedFor: '2001:db8:9:0:ffff::2',
+      trustProxy: true,
+    }),
+  ).toBe('fwd:2001:db8:9:0');
+  expect(
+    deskClientKey({
+      forwardedFor: 'fe80::1%eth0',
+      trustProxy: true,
+    }),
+  ).toBe('fwd:fe80:0:0:0');
+  expect(
+    deskClientKey({
+      forwardedFor: 'FE80::2%eth1',
+      trustProxy: true,
+    }),
+  ).toBe('fwd:fe80:0:0:0');
+  expect(
+    deskClientKey({
+      forwardedFor: 'garbage, 203.0.113.10',
+      trustProxy: true,
+    }),
+  ).toBe('fwd:203.0.113.10');
+  for (const forwardedFor of ['garbage', '!!!', 'gggg::1', null, ' ']) {
+    expect(deskClientKey({ forwardedFor, trustProxy: true })).toBe(
+      'fwd:unparsed',
+    );
+  }
+
+  const now = 1_700_000_000_000;
+  lock('fwd:unparsed', now);
+  expect(loginLimited('fwd:unparsed', now)).toBe(true);
+  expect(loginLimited('fwd:203.0.113.77', now)).toBe(false);
+  expect(loginLimited('fwd:fe80:0:0:0', now)).toBe(false);
 });
 
 function lock(key: string, now: number): void {
