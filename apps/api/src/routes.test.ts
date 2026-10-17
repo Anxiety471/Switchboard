@@ -95,6 +95,39 @@ async function markRead(token: string, ids: string[]): Promise<ReadReceipt> {
   return response.json();
 }
 
+function searchCursor(createdAt: string, id: string): string {
+  return Buffer.from(`${createdAt}|${id}`, 'utf8').toString('base64url');
+}
+
+function bodies(page: InboxPage): string[] {
+  return page.messages.map((message) => message.body);
+}
+
+async function search(
+  token: string,
+  filters: Record<string, string | number> = {},
+): Promise<InboxPage> {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    params.set(key, String(value));
+  }
+  const query = params.toString();
+  const response = await app.inject({
+    method: 'GET',
+    url: query === '' ? '/messages/search' : `/messages/search?${query}`,
+    headers: bearer(token),
+  });
+  expect(response.statusCode, response.body).toBe(200);
+  return response.json();
+}
+
+async function stamp(id: string, createdAt: string): Promise<void> {
+  await admin.query('UPDATE messages SET created_at = $2 WHERE id = $1', [
+    id,
+    createdAt,
+  ]);
+}
+
 test('migration creates agents, messages, and per-recipient receipts', async () => {
   const tables = await admin.query<{ table_name: string }>(
     `SELECT table_name
@@ -263,6 +296,7 @@ test('missing token is unauthorized on protected routes', async () => {
     },
     { method: 'GET' as const, url: '/inbox' },
     { method: 'GET' as const, url: '/inbox?unread=true' },
+    { method: 'GET' as const, url: '/messages/search' },
     { method: 'POST' as const, url: '/inbox/read', payload: { ids: [] } },
     { method: 'GET' as const, url: '/missing' },
   ];
@@ -290,6 +324,7 @@ test('wrong token is unauthorized and is not echoed', async () => {
   const routes = [
     { method: 'GET' as const, url: '/agents' },
     { method: 'GET' as const, url: '/inbox?unread=true' },
+    { method: 'GET' as const, url: '/messages/search' },
     {
       method: 'POST' as const,
       url: '/messages',
@@ -1032,4 +1067,509 @@ test('GET /inbox rejects cursor dates Postgres cannot store', async () => {
     expect(response.statusCode, createdAt).toBe(400);
     expect(response.json()).toEqual({ error: 'invalid request' });
   }
+});
+
+test('GET /messages/search filters status, box, from, since, until, and text', async () => {
+  const alpha = await register('alpha');
+  const beta = await register('beta');
+  const gamma = await register('gamma');
+  const fromBeta = await send(beta.token, {
+    to: 'alpha',
+    body: 'alpha unread from beta',
+  });
+  const fromGamma = await send(gamma.token, {
+    to: 'alpha',
+    body: 'alpha read from gamma',
+  });
+  const toBeta = await send(alpha.token, {
+    to: 'beta',
+    body: 'beta unread from alpha',
+  });
+  const toGamma = await send(alpha.token, {
+    to: 'gamma',
+    body: 'gamma read from alpha',
+  });
+  const broadcast = await send(alpha.token, {
+    to: '*',
+    body: 'broadcast hello',
+  });
+  await stamp(fromBeta.id, '2024-01-01T00:00:00.000Z');
+  await stamp(fromGamma.id, '2024-01-02T00:00:00.000Z');
+  await stamp(toBeta.id, '2024-01-03T00:00:00.000Z');
+  await stamp(toGamma.id, '2024-01-04T00:00:00.000Z');
+  await stamp(broadcast.id, '2024-01-05T00:00:00.000Z');
+  await markRead(alpha.token, [fromGamma.id]);
+  await markRead(gamma.token, [toGamma.id]);
+  await markRead(beta.token, [broadcast.id]);
+
+  expect(bodies(await search(alpha.token))).toEqual(['alpha unread from beta']);
+  const read = await search(alpha.token, { status: 'read' });
+  expect(bodies(read)).toEqual(['alpha read from gamma']);
+  expect(read.messages[0]?.readAt).toEqual(expect.any(String));
+  expect(bodies(await search(alpha.token, { status: 'all' }))).toEqual([
+    'alpha unread from beta',
+    'alpha read from gamma',
+  ]);
+  expect(
+    bodies(await search(alpha.token, { status: 'all', from: 'GAMMA' })),
+  ).toEqual(['alpha read from gamma']);
+  expect(
+    bodies(await search(alpha.token, { status: 'read', from: 'beta' })),
+  ).toEqual([]);
+  expect(
+    bodies(
+      await search(alpha.token, {
+        status: 'all',
+        since: '2024-01-02T00:00:00.000Z',
+      }),
+    ),
+  ).toEqual(['alpha read from gamma']);
+  expect(
+    bodies(
+      await search(alpha.token, {
+        status: 'all',
+        until: '2024-01-01T00:00:00.000Z',
+      }),
+    ),
+  ).toEqual(['alpha unread from beta']);
+  expect(
+    bodies(
+      await search(alpha.token, {
+        status: 'all',
+        since: '2024-01-01T00:00:00+00:00',
+        until: '2024-01-01T00:00:00.000Z',
+      }),
+    ),
+  ).toEqual(['alpha unread from beta']);
+  expect(
+    bodies(
+      await search(alpha.token, {
+        status: 'all',
+        since: '2024-01-01T00:00:00.001Z',
+      }),
+    ),
+  ).toEqual(['alpha read from gamma']);
+  expect(
+    bodies(await search(alpha.token, { status: 'all', text: 'UNREAD' })),
+  ).toEqual(['alpha unread from beta']);
+
+  expect(bodies(await search(alpha.token, { box: 'sent' }))).toEqual([
+    'beta unread from alpha',
+    'broadcast hello',
+  ]);
+  const sentRead = await search(alpha.token, { box: 'sent', status: 'read' });
+  expect(bodies(sentRead)).toEqual(['gamma read from alpha']);
+  expect(sentRead.messages[0]).toMatchObject({
+    to: 'gamma',
+    readAt: expect.any(String),
+  });
+  expect(
+    bodies(
+      await search(alpha.token, { box: 'sent', status: 'all', from: 'alpha' }),
+    ),
+  ).toEqual([
+    'beta unread from alpha',
+    'gamma read from alpha',
+    'broadcast hello',
+  ]);
+  expect(
+    bodies(
+      await search(alpha.token, { box: 'sent', status: 'all', from: 'beta' }),
+    ),
+  ).toEqual([]);
+
+  expect(bodies(await search(beta.token))).toEqual(['beta unread from alpha']);
+  expect(bodies(await search(beta.token, { status: 'read' }))).toEqual([
+    'broadcast hello',
+  ]);
+  expect(bodies(await search(gamma.token))).toEqual(['broadcast hello']);
+  expect(bodies(await search(gamma.token, { status: 'read' }))).toEqual([
+    'gamma read from alpha',
+  ]);
+  const betaView = JSON.stringify([
+    await search(beta.token, { status: 'all', box: 'received' }),
+    await search(beta.token, { status: 'all', box: 'sent' }),
+  ]);
+  expect(betaView).not.toContain('alpha read from gamma');
+  expect(betaView).not.toContain('gamma read from alpha');
+  expect(betaView).not.toContain(fromGamma.id);
+
+  expect(
+    (await search(alpha.token, { box: 'sent', text: 'broadcast' })).messages[0]
+      ?.readAt,
+  ).toBeNull();
+  await markRead(gamma.token, [broadcast.id]);
+  const fullyRead = await search(alpha.token, {
+    box: 'sent',
+    status: 'read',
+    text: 'broadcast',
+  });
+  expect(fullyRead.messages).toHaveLength(1);
+  expect(fullyRead.messages[0]?.readAt).toEqual(expect.any(String));
+  expect(
+    bodies(
+      await search(alpha.token, {
+        box: 'sent',
+        status: 'unread',
+        text: 'broadcast',
+      }),
+    ),
+  ).toEqual([]);
+
+  const solo = await register('solo');
+  await send(solo.token, { to: '*', body: 'nobody else' });
+  const soloSent = await search(solo.token, { box: 'sent' });
+  expect(bodies(soloSent)).toEqual(['nobody else']);
+  expect(soloSent.messages[0]?.readAt).toBeNull();
+  expect(
+    bodies(await search(solo.token, { box: 'sent', status: 'read' })),
+  ).toEqual([]);
+});
+
+test('GET /messages/search does not change read_at', async () => {
+  const alpha = await register('alpha');
+  const beta = await register('beta');
+  const sent = await send(alpha.token, { to: 'beta', body: 'still unread' });
+  const before = await admin.query(
+    `SELECT message_id, agent_id, read_at
+     FROM message_receipts
+     ORDER BY message_id, agent_id`,
+  );
+  expect(before.rows[0]?.read_at).toBeNull();
+  await search(beta.token, { status: 'all', text: 'unread' });
+  await search(alpha.token, { box: 'sent', status: 'all' });
+  await search(beta.token);
+  const after = await admin.query(
+    `SELECT message_id, agent_id, read_at
+     FROM message_receipts
+     ORDER BY message_id, agent_id`,
+  );
+  expect(after.rows).toEqual(before.rows);
+  const unread = await inbox(beta.token, true);
+  expect(unread.messages.map((message) => message.id)).toEqual([sent.id]);
+  expect(unread.messages[0]?.readAt).toBeNull();
+
+  await markRead(beta.token, [sent.id]);
+  const read = await search(beta.token, { status: 'read' });
+  expect(read.messages[0]?.id).toBe(sent.id);
+  const stored = await admin.query<{ read_at: Date }>(
+    `SELECT read_at
+     FROM message_receipts
+     WHERE message_id = $1 AND agent_id = $2`,
+    [sent.id, beta.id],
+  );
+  expect(stored.rows[0]?.read_at.toISOString()).toBe(read.messages[0]?.readAt);
+  expect(bodies(await search(beta.token))).toEqual([]);
+  expect(
+    bodies(await search(alpha.token, { box: 'sent', status: 'read' })),
+  ).toEqual(['still unread']);
+});
+
+test('GET /messages/search pages with an opaque cursor', async () => {
+  const alpha = await register('alpha');
+  const beta = await register('beta');
+  const createdAt = '2024-03-01T00:00:00.000Z';
+  const ids = [
+    '00000000-0000-4000-8000-000000000003',
+    '00000000-0000-4000-8000-000000000001',
+    '00000000-0000-4000-8000-000000000002',
+  ];
+  for (const [index, id] of ids.entries()) {
+    await admin.query(
+      `INSERT INTO messages (id, from_agent, to_agent, body, created_at)
+       VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5)`,
+      [id, beta.id, alpha.id, `tie-${index}`, createdAt],
+    );
+    await admin.query(
+      `INSERT INTO message_receipts (message_id, agent_id)
+       VALUES ($1::uuid, $2::uuid)`,
+      [id, alpha.id],
+    );
+  }
+
+  const full = await search(alpha.token, { status: 'all', limit: 10 });
+  expect(full.messages).toHaveLength(3);
+  expect(full.next).toBeNull();
+  const walked: string[] = [];
+  let cursor: string | undefined;
+  for (let step = 0; step < 4; step += 1) {
+    const page = await search(
+      alpha.token,
+      cursor === undefined
+        ? { status: 'all', limit: 1 }
+        : { status: 'all', limit: 1, cursor },
+    );
+    expect(page.messages).toHaveLength(1);
+    const current = page.messages[0];
+    if (current === undefined) {
+      throw new Error('expected a message');
+    }
+    walked.push(current.id);
+    if (page.next === null) {
+      break;
+    }
+    expect(page.next).toBe(searchCursor(current.createdAt, current.id));
+    cursor = page.next;
+  }
+  expect(walked).toEqual(full.messages.map((message) => message.id));
+  expect(cursor).toBe(
+    searchCursor(full.messages[1]?.createdAt ?? '', full.messages[1]?.id ?? ''),
+  );
+
+  const first = full.messages[0];
+  const middle = full.messages[1];
+  const last = full.messages[2];
+  if (first === undefined || middle === undefined || last === undefined) {
+    throw new Error('expected three messages');
+  }
+  expect(
+    bodies(
+      await search(alpha.token, {
+        status: 'all',
+        cursor: searchCursor(first.createdAt, first.id),
+      }),
+    ),
+  ).toEqual([middle.body, last.body]);
+  const afterMiddle = await search(alpha.token, {
+    status: 'all',
+    limit: 1,
+    cursor: searchCursor(middle.createdAt, middle.id),
+  });
+  expect(bodies(afterMiddle)).toEqual([last.body]);
+  expect(afterMiddle.next).toBeNull();
+  expect(
+    await search(alpha.token, {
+      status: 'all',
+      cursor: searchCursor(last.createdAt, last.id),
+    }),
+  ).toEqual({ messages: [], next: null });
+  expect(
+    bodies(
+      await search(alpha.token, {
+        status: 'all',
+        cursor: searchCursor(first.createdAt, first.id),
+      }),
+    ),
+  ).toEqual([middle.body, last.body]);
+});
+
+test('GET /messages/search caps a page at 100', async () => {
+  const alpha = await register('alpha');
+  const beta = await register('beta');
+  await admin.query(
+    `INSERT INTO messages (from_agent, to_agent, body, created_at)
+     SELECT $1::uuid,
+            $2::uuid,
+            'm' || g::text,
+            timestamp '2024-04-01' + (g::text || ' milliseconds')::interval
+     FROM generate_series(1, 101) AS g`,
+    [beta.id, alpha.id],
+  );
+  await admin.query(
+    `INSERT INTO message_receipts (message_id, agent_id)
+     SELECT id, $1::uuid FROM messages`,
+    [alpha.id],
+  );
+
+  const defaults = await search(alpha.token);
+  expect(defaults.messages).toHaveLength(50);
+  expect(defaults.messages[0]?.body).toBe('m1');
+  expect(defaults.messages[49]?.body).toBe('m50');
+  expect(defaults.next).not.toBeNull();
+
+  const first = await search(alpha.token, { limit: 100 });
+  expect(first.messages).toHaveLength(100);
+  expect(first.messages[0]?.body).toBe('m1');
+  expect(first.messages[99]?.body).toBe('m100');
+  const next = first.next;
+  const boundary = first.messages[99];
+  if (next === null || boundary === undefined) {
+    throw new Error('expected a cursor');
+  }
+  expect(next).toBe(searchCursor(boundary.createdAt, boundary.id));
+  const second = await search(alpha.token, { limit: 100, cursor: next });
+  expect(bodies(second)).toEqual(['m101']);
+  expect(second.next).toBeNull();
+  expect(second.messages[0]?.id).not.toBe(boundary.id);
+
+  const exact = await search(alpha.token, {
+    limit: 100,
+    until: boundary.createdAt,
+  });
+  expect(exact.messages).toHaveLength(100);
+  expect(exact.next).toBeNull();
+  expect(exact.messages[99]?.body).toBe('m100');
+});
+
+test('GET /messages/search rejects a malformed or foreign cursor', async () => {
+  const alpha = await register('alpha');
+  const beta = await register('beta');
+  const gamma = await register('gamma');
+  const secret = await send(beta.token, {
+    to: 'alpha',
+    body: 'only-for-alpha',
+  });
+  await stamp(secret.id, '2024-05-01T00:00:00.000Z');
+  const owned = await search(alpha.token, { status: 'all' });
+  const message = owned.messages[0];
+  if (message === undefined) {
+    throw new Error('expected a message');
+  }
+  expect(
+    await search(alpha.token, {
+      status: 'all',
+      cursor: searchCursor(message.createdAt, message.id),
+    }),
+  ).toEqual({ messages: [], next: null });
+
+  const between = await send(beta.token, { to: 'gamma', body: 'beta-gamma' });
+  await stamp(between.id, '2024-06-01T00:00:00.000Z');
+  const hidden = await search(gamma.token, { status: 'all' });
+  const foreignMessage = hidden.messages[0];
+  if (foreignMessage === undefined) {
+    throw new Error('expected a foreign message');
+  }
+  const foreign = searchCursor(foreignMessage.createdAt, foreignMessage.id);
+  for (const box of ['received', 'sent']) {
+    const response = await app.inject({
+      method: 'GET',
+      url: `/messages/search?${new URLSearchParams({
+        status: 'all',
+        box,
+        cursor: foreign,
+      })}`,
+      headers: bearer(alpha.token),
+    });
+    expect(response.statusCode, box).toBe(400);
+    expect(response.json()).toEqual({ error: 'invalid request' });
+    expect(response.body).not.toContain('beta-gamma');
+    expect(response.body).not.toContain(between.id);
+    expect(response.body).not.toContain(alpha.token);
+  }
+
+  const sent = await send(alpha.token, { to: 'beta', body: 'alpha-sent' });
+  await stamp(sent.id, '2024-05-02T00:00:00.000Z');
+  const sentPage = await search(alpha.token, { box: 'sent', status: 'all' });
+  const sentMessage = sentPage.messages.find((item) => item.id === sent.id);
+  if (sentMessage === undefined) {
+    throw new Error('expected the sent message');
+  }
+  const receivedAfterSent = await search(alpha.token, {
+    box: 'received',
+    status: 'all',
+    cursor: searchCursor(sentMessage.createdAt, sentMessage.id),
+  });
+  expect(receivedAfterSent.messages.map((item) => item.id)).not.toContain(
+    sent.id,
+  );
+
+  const bad = [
+    'nope',
+    "'); DROP TABLE messages;--",
+    `${message.createdAt}|${message.id}`,
+    searchCursor('2026-02-30T00:00:00.000Z', message.id),
+    searchCursor('0000-01-01T00:00:00.000Z', message.id),
+    searchCursor(message.createdAt, '00000000-0000-4000-8000-000000000099'),
+    searchCursor('2024-01-01T00:00:00.000Z', message.id),
+    `${searchCursor(message.createdAt, message.id)}=`,
+    '%%%',
+  ];
+  for (const cursor of bad) {
+    const response = await app.inject({
+      method: 'GET',
+      url: `/messages/search?${new URLSearchParams({
+        status: 'all',
+        cursor,
+      })}`,
+      headers: bearer(alpha.token),
+    });
+    expect(response.statusCode, cursor).toBe(400);
+    expect(response.json()).toEqual({ error: 'invalid request' });
+  }
+  const surviving = await admin.query<{ count: number }>(
+    'SELECT count(*)::int AS count FROM messages',
+  );
+  expect(surviving.rows[0]?.count).toBe(3);
+  expect(
+    bodies(
+      await search(alpha.token, { status: 'all', text: 'only-for-alpha' }),
+    ),
+  ).toEqual(['only-for-alpha']);
+  const untouched = await admin.query<{ read_at: Date | null }>(
+    `SELECT read_at
+     FROM message_receipts
+     WHERE message_id = $1 AND agent_id = $2`,
+    [secret.id, alpha.id],
+  );
+  expect(untouched.rows[0]?.read_at).toBeNull();
+});
+
+test('GET /messages/search escapes LIKE wildcards', async () => {
+  const alpha = await register('alpha');
+  const beta = await register('beta');
+  const samples = [
+    '100%',
+    '100',
+    'a_b',
+    'axb',
+    'a\\b',
+    '100\\%',
+    "'); DROP TABLE agents;--",
+  ];
+  for (const [index, body] of samples.entries()) {
+    const sent = await send(beta.token, { to: 'alpha', body });
+    await stamp(
+      sent.id,
+      `2024-07-01T00:00:00.${String(index + 1).padStart(3, '0')}Z`,
+    );
+  }
+  const find = async (text: string): Promise<string[]> =>
+    bodies(await search(alpha.token, { status: 'all', text }));
+
+  expect(await find('%')).toEqual(['100%', '100\\%']);
+  expect(await find('_')).toEqual(['a_b']);
+  expect(await find('\\')).toEqual(['a\\b', '100\\%']);
+  expect(await find('\\%')).toEqual(['100\\%']);
+  expect(await find('100%')).toEqual(['100%']);
+  expect(await find("'); DROP TABLE agents;--")).toEqual([
+    "'); DROP TABLE agents;--",
+  ]);
+  expect(await find("%' OR '1'='1")).toEqual([]);
+  const agents = await admin.query<{ count: number }>(
+    'SELECT count(*)::int AS count FROM agents',
+  );
+  expect(agents.rows[0]?.count).toBe(2);
+  const messages = await admin.query<{ count: number }>(
+    'SELECT count(*)::int AS count FROM messages',
+  );
+  expect(messages.rows[0]?.count).toBe(samples.length);
+});
+
+test('GET /messages/search rejects invalid filters', async () => {
+  const alpha = await register('alpha');
+  const cases = [
+    'status=opened',
+    'box=both',
+    'limit=0',
+    'limit=101',
+    'from=*',
+    'since=yesterday',
+    'since=2026-02-30T00:00:00.000Z',
+    'until=0000-01-01T00:00:00.000Z',
+    'text=',
+    'agent=alpha',
+    'cursor=',
+    `text=${'é'.repeat(4097)}`,
+    'text=%00',
+  ];
+  for (const query of cases) {
+    const response = await app.inject({
+      method: 'GET',
+      url: `/messages/search?${query}`,
+      headers: bearer(alpha.token),
+    });
+    expect(response.statusCode, query).toBe(400);
+    expect(response.json()).toEqual({ error: 'invalid request' });
+  }
+  expect((await search(alpha.token, { limit: 100 })).messages).toEqual([]);
 });

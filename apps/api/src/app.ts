@@ -17,6 +17,8 @@ const MAX_BODY_BYTES = 8192;
 const MAX_READ_IDS = 100;
 const DEFAULT_INBOX_LIMIT = 50;
 const MAX_INBOX_LIMIT = 200;
+const DEFAULT_SEARCH_LIMIT = 50;
+const MAX_SEARCH_LIMIT = 100;
 const ONLINE_INTERVAL = '60 seconds';
 const MIGRATION_RETRY_MIN_MS = 200;
 const MIGRATION_RETRY_MAX_MS = 5000;
@@ -29,6 +31,8 @@ const UUID_PATTERN =
   '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';
 const CURSOR_PATTERN =
   /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\|([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$/;
+const FILTER_TIME_PATTERN =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/;
 
 const REDACT_PATHS = [
   'req.headers.authorization',
@@ -109,6 +113,17 @@ type InboxQuery = {
   after?: string;
 };
 
+type SearchQuery = {
+  status?: string;
+  from?: string;
+  since?: string;
+  until?: string;
+  text?: string;
+  box?: string;
+  limit?: string;
+  cursor?: string;
+};
+
 type InboxCursor = {
   createdAt: string;
   id: string;
@@ -161,6 +176,11 @@ function pgField(
   return typeof value === 'string' ? value : undefined;
 }
 
+function isDataException(error: unknown): boolean {
+  const code = pgField(error, 'code');
+  return code !== undefined && code.startsWith('22');
+}
+
 function statusCodeOf(error: unknown): number {
   if (typeof error === 'object' && error !== null && 'statusCode' in error) {
     const statusCode = error.statusCode;
@@ -198,10 +218,6 @@ function isoTime(value: Date | string | null): string | null {
   return new Date(value).toISOString();
 }
 
-function requiredIsoTime(value: Date | string | null): string | null {
-  return isoTime(value);
-}
-
 function caller(request: {
   agent: AuthenticatedAgent | null;
 }): AuthenticatedAgent {
@@ -220,6 +236,20 @@ function inboxLimit(value: string | undefined): number | undefined {
   }
   const parsed = Number(value);
   if (parsed > MAX_INBOX_LIMIT) {
+    return undefined;
+  }
+  return parsed;
+}
+
+function searchLimit(value: string | undefined): number | undefined {
+  if (value === undefined) {
+    return DEFAULT_SEARCH_LIMIT;
+  }
+  if (!/^[1-9]\d{0,2}$/.test(value)) {
+    return undefined;
+  }
+  const parsed = Number(value);
+  if (parsed > MAX_SEARCH_LIMIT) {
     return undefined;
   }
   return parsed;
@@ -247,6 +277,118 @@ function parseCursor(
     return undefined;
   }
   return { createdAt, id };
+}
+
+function encodeSearchCursor(createdAt: string, id: string): string {
+  return Buffer.from(`${createdAt}|${id}`, 'utf8').toString('base64url');
+}
+
+function parseSearchCursor(
+  value: string | undefined,
+): InboxCursor | null | undefined {
+  if (value === undefined) {
+    return null;
+  }
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
+    return undefined;
+  }
+  const decoded = Buffer.from(value, 'base64url').toString('utf8');
+  if (Buffer.from(decoded, 'utf8').toString('base64url') !== value) {
+    return undefined;
+  }
+  const match = CURSOR_PATTERN.exec(decoded);
+  const createdAt = match?.[1];
+  const id = match?.[2];
+  if (createdAt === undefined || id === undefined || !isCursorTime(createdAt)) {
+    return undefined;
+  }
+  return { createdAt, id };
+}
+
+function offsetMinutes(offset: string): number | undefined {
+  if (offset === 'Z') {
+    return 0;
+  }
+  const match = /^([+-])(\d{2}):(\d{2})$/.exec(offset);
+  const sign = match?.[1];
+  const hours = match?.[2];
+  const minutes = match?.[3];
+  if (sign === undefined || hours === undefined || minutes === undefined) {
+    return undefined;
+  }
+  const hour = Number(hours);
+  const minute = Number(minutes);
+  if (hour > 23 || minute > 59) {
+    return undefined;
+  }
+  return (sign === '-' ? -1 : 1) * (hour * 60 + minute);
+}
+
+function filterTime(value: string | undefined): string | null | undefined {
+  if (value === undefined) {
+    return null;
+  }
+  const match = FILTER_TIME_PATTERN.exec(value);
+  const yearText = match?.[1];
+  const offset = match?.[8];
+  if (yearText === undefined || offset === undefined || match === null) {
+    return undefined;
+  }
+  const year = Number(yearText);
+  if (!Number.isInteger(year) || year < 1 || year > 9999) {
+    return undefined;
+  }
+  const parsed = new Date(value);
+  const shift = offsetMinutes(offset);
+  if (Number.isNaN(parsed.getTime()) || shift === undefined) {
+    return undefined;
+  }
+  const wall = new Date(parsed.getTime() + shift * 60_000);
+  const fields = [1, 2, 3, 4, 5, 6].map((group) => Number(match[group]));
+  if (
+    wall.getUTCFullYear() !== fields[0] ||
+    wall.getUTCMonth() + 1 !== fields[1] ||
+    wall.getUTCDate() !== fields[2] ||
+    wall.getUTCHours() !== fields[3] ||
+    wall.getUTCMinutes() !== fields[4] ||
+    wall.getUTCSeconds() !== fields[5] ||
+    wall.getUTCFullYear() < 1 ||
+    wall.getUTCFullYear() > 9999
+  ) {
+    return undefined;
+  }
+  return parsed.toISOString();
+}
+
+function escapeLike(value: string): string {
+  return value.replace(/[\\%_]/g, (char) => `\\${char}`);
+}
+
+async function searchCursorAllowed(
+  pool: Pool,
+  agentId: string,
+  cursor: InboxCursor,
+): Promise<boolean> {
+  const result = await pool.query<{
+    time_matches: boolean;
+    visible: boolean;
+  }>(
+    `SELECT date_trunc('milliseconds', m.created_at) = $2::timestamptz AS time_matches,
+            (
+              m.from_agent = $1::uuid
+              OR EXISTS (
+                SELECT 1
+                FROM message_receipts r
+                WHERE r.message_id = m.id
+                  AND r.agent_id = $1::uuid
+              )
+            ) AS visible
+     FROM messages m
+     WHERE m.id = $3::uuid`,
+    [agentId, cursor.createdAt, cursor.id],
+  );
+  const row = result.rows[0];
+  return row !== undefined && row.time_matches === true && row.visible === true;
 }
 
 function unavailableMessage(error: object): boolean {
@@ -806,6 +948,235 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
     },
   );
 
+  app.get<{ Querystring: SearchQuery }>(
+    '/messages/search',
+    {
+      schema: {
+        querystring: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            status: { type: 'string', enum: ['unread', 'read', 'all'] },
+            from: {
+              type: 'string',
+              minLength: 1,
+              maxLength: 64,
+              pattern: '^[A-Za-z0-9][A-Za-z0-9_-]*$',
+            },
+            since: { type: 'string', minLength: 1, maxLength: 40 },
+            until: { type: 'string', minLength: 1, maxLength: 40 },
+            text: { type: 'string', minLength: 1, maxLength: MAX_BODY_BYTES },
+            box: { type: 'string', enum: ['received', 'sent'] },
+            limit: { type: 'string', pattern: '^[1-9][0-9]{0,2}$' },
+            cursor: { type: 'string', minLength: 1, maxLength: 128 },
+          },
+        },
+        response: {
+          200: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['messages', 'next'],
+            properties: {
+              messages: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  additionalProperties: false,
+                  required: ['id', 'from', 'to', 'body', 'createdAt', 'readAt'],
+                  properties: {
+                    id: { type: 'string' },
+                    from: { type: 'string' },
+                    to: { type: 'string' },
+                    body: { type: 'string' },
+                    createdAt: { type: 'string' },
+                    readAt: { type: ['string', 'null'] },
+                  },
+                },
+              },
+              next: { type: ['string', 'null'] },
+            },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const agent = caller(request);
+      const limit = searchLimit(request.query.limit);
+      const cursor = parseSearchCursor(request.query.cursor);
+      const since = filterTime(request.query.since);
+      const until = filterTime(request.query.until);
+      const text = request.query.text;
+      if (
+        limit === undefined ||
+        cursor === undefined ||
+        since === undefined ||
+        until === undefined ||
+        (text !== undefined &&
+          (text.includes('\0') ||
+            Buffer.byteLength(text, 'utf8') > MAX_BODY_BYTES))
+      ) {
+        return reply.code(400).send({ error: 'invalid request' });
+      }
+      const status = request.query.status ?? 'unread';
+      const box = request.query.box ?? 'received';
+      try {
+        if (cursor !== null) {
+          const allowed = await searchCursorAllowed(pool, agent.id, cursor);
+          if (!allowed) {
+            return reply.code(400).send({ error: 'invalid request' });
+          }
+        }
+        const result = await pool.query<{
+          id: string;
+          from_name: string;
+          to_name: string;
+          body: string;
+          created_at: Date | string;
+          read_at: Date | string | null;
+        }>(
+          `SELECT m.id,
+                  sender.name AS from_name,
+                  CASE
+                    WHEN m.to_agent IS NULL THEN '*'
+                    ELSE recipient.name
+                  END AS to_name,
+                  m.body,
+                  date_trunc('milliseconds', m.created_at) AS created_at,
+                  CASE
+                    WHEN $2::text = 'received' THEN own.read_at
+                    WHEN m.to_agent IS NOT NULL THEN dest.read_at
+                    ELSE (
+                      SELECT max(broadcast.read_at)
+                      FROM message_receipts broadcast
+                      WHERE broadcast.message_id = m.id
+                      HAVING bool_and(broadcast.read_at IS NOT NULL)
+                    )
+                  END AS read_at
+           FROM messages m
+           JOIN agents sender ON sender.id = m.from_agent
+           LEFT JOIN agents recipient ON recipient.id = m.to_agent
+           LEFT JOIN message_receipts own
+             ON own.message_id = m.id
+            AND own.agent_id = $1::uuid
+           LEFT JOIN message_receipts dest
+             ON dest.message_id = m.id
+            AND dest.agent_id = m.to_agent
+           WHERE (
+             ($2::text = 'received' AND own.agent_id IS NOT NULL)
+             OR ($2::text = 'sent' AND m.from_agent = $1::uuid)
+           )
+             AND (
+               $3::text = 'all'
+               OR (
+                 $2::text = 'received'
+                 AND (
+                   ($3::text = 'unread' AND own.read_at IS NULL)
+                   OR ($3::text = 'read' AND own.read_at IS NOT NULL)
+                 )
+               )
+               OR (
+                 $2::text = 'sent'
+                 AND (
+                   (
+                     $3::text = 'unread'
+                     AND (
+                       NOT EXISTS (
+                         SELECT 1
+                         FROM message_receipts sent_any
+                         WHERE sent_any.message_id = m.id
+                       )
+                       OR EXISTS (
+                         SELECT 1
+                         FROM message_receipts sent_unread
+                         WHERE sent_unread.message_id = m.id
+                           AND sent_unread.read_at IS NULL
+                       )
+                     )
+                   )
+                   OR (
+                     $3::text = 'read'
+                     AND EXISTS (
+                       SELECT 1
+                       FROM message_receipts sent_read
+                       WHERE sent_read.message_id = m.id
+                     )
+                     AND NOT EXISTS (
+                       SELECT 1
+                       FROM message_receipts sent_unread
+                       WHERE sent_unread.message_id = m.id
+                         AND sent_unread.read_at IS NULL
+                     )
+                   )
+                 )
+               )
+             )
+             AND ($4::text IS NULL OR lower(sender.name) = lower($4))
+             AND (
+               $5::timestamptz IS NULL
+               OR date_trunc('milliseconds', m.created_at) >= $5::timestamptz
+             )
+             AND (
+               $6::timestamptz IS NULL
+               OR date_trunc('milliseconds', m.created_at) <= $6::timestamptz
+             )
+             AND (
+               $7::text IS NULL
+               OR m.body ILIKE ('%' || $7 || '%') ESCAPE '\\'
+             )
+             AND (
+               $8::timestamptz IS NULL
+               OR (
+                 date_trunc('milliseconds', m.created_at),
+                 m.id
+               ) > ($8::timestamptz, $9::uuid)
+             )
+           ORDER BY date_trunc('milliseconds', m.created_at) ASC, m.id ASC
+           LIMIT $10`,
+          [
+            agent.id,
+            box,
+            status,
+            request.query.from ?? null,
+            since,
+            until,
+            text === undefined ? null : escapeLike(text),
+            cursor?.createdAt ?? null,
+            cursor?.id ?? null,
+            limit + 1,
+          ],
+        );
+        const hasMore = result.rows.length > limit;
+        const pageRows = hasMore ? result.rows.slice(0, limit) : result.rows;
+        const messages: InboxMessage[] = pageRows.map((row) => ({
+          id: row.id,
+          from: row.from_name,
+          to: row.to_name,
+          body: row.body,
+          createdAt: isoTime(row.created_at) ?? '',
+          readAt: isoTime(row.read_at),
+        }));
+        const last = messages[messages.length - 1];
+        const page: InboxPage = {
+          messages,
+          next:
+            hasMore && last !== undefined
+              ? encodeSearchCursor(last.createdAt, last.id)
+              : null,
+        };
+        return page;
+      } catch (error) {
+        if (isDatabaseUnavailable(error)) {
+          app.log.error(unavailableLog(error), 'database unavailable');
+          return reply.code(503).send(databaseUnavailableBody());
+        }
+        if (isDataException(error)) {
+          return reply.code(400).send({ error: 'invalid request' });
+        }
+        throw error;
+      }
+    },
+  );
+
   app.post<{ Body: ReadBody }>(
     '/inbox/read',
     {
@@ -877,7 +1248,7 @@ export function buildApp(databaseUrl: string, options?: BuildAppOptions) {
         if (row === undefined) {
           return [];
         }
-        return [{ id: row.message_id, readAt: requiredIsoTime(row.read_at) }];
+        return [{ id: row.message_id, readAt: isoTime(row.read_at) }];
       });
       const body: ReadReceipt = {
         read: marked.map((item) => item.id),

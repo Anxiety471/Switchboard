@@ -16,6 +16,7 @@ type Reply = { status: number; json: unknown };
 
 const TOKEN = 'agent-token-value';
 const CURSOR = '2024-01-01T00:00:00.000Z|00000000-0000-4000-8000-000000000001';
+const SEARCH_CURSOR = Buffer.from(CURSOR, 'utf8').toString('base64url');
 const READ_AT = '2024-06-15T12:34:56.789Z';
 const OTHER_READ_AT = '2024-06-15T12:34:57.001Z';
 const MARK_READ_WARNING =
@@ -180,16 +181,24 @@ function apiError(text: string): { error: string; status: number } {
   return { error: parsed.error, status: parsed.status };
 }
 
-test('exposes list_agents, send_message, and check_inbox', async () => {
+test('exposes list_agents, send_message, check_inbox, and search_messages', async () => {
   const session = await connect('http://127.0.0.1:9');
   try {
     const listed = await session.client.listTools();
     expect(listed.tools.map((tool) => tool.name).sort()).toEqual([
       'check_inbox',
       'list_agents',
+      'search_messages',
       'send_message',
     ]);
     expect(session.client.getInstructions()).toContain('check_inbox');
+    expect(session.client.getInstructions()).toContain('search_messages');
+    const inbox = listed.tools.find((tool) => tool.name === 'check_inbox');
+    expect(inbox?.description).toContain(
+      'readAt can be null when the API is an older version that does not return read times',
+    );
+    const search = listed.tools.find((tool) => tool.name === 'search_messages');
+    expect(search?.description).toContain('Does not mark messages read');
   } finally {
     await session.close();
   }
@@ -227,6 +236,26 @@ test('rejects invalid tool input before calling the API', async () => {
         {
           after:
             '2026-02-30T00:00:00.000Z|00000000-0000-4000-8000-000000000001',
+        },
+      ],
+      ['search_messages', { status: 'opened' }],
+      ['search_messages', { box: 'both' }],
+      ['search_messages', { from: 'has space' }],
+      ['search_messages', { from: '*' }],
+      ['search_messages', { since: 'yesterday' }],
+      ['search_messages', { until: '2026-02-30T00:00:00.000Z' }],
+      ['search_messages', { text: '' }],
+      ['search_messages', { text: 'bad\0byte' }],
+      ['search_messages', { limit: 0 }],
+      ['search_messages', { limit: 101 }],
+      ['search_messages', { cursor: 'nope' }],
+      [
+        'search_messages',
+        {
+          cursor: Buffer.from(
+            '2026-02-30T00:00:00.000Z|00000000-0000-4000-8000-000000000001',
+            'utf8',
+          ).toString('base64url'),
         },
       ],
     ] as const;
@@ -306,7 +335,12 @@ test('maps 401, 400, and 503 responses from the API', async () => {
     }));
     const session = await connect(mock.url);
     try {
-      for (const name of ['list_agents', 'send_message', 'check_inbox']) {
+      for (const name of [
+        'list_agents',
+        'send_message',
+        'check_inbox',
+        'search_messages',
+      ]) {
         const args =
           name === 'send_message' ? { to: 'beta', body: 'hello' } : {};
         const result = await callTool(
@@ -332,6 +366,87 @@ test('maps 401, 400, and 503 responses from the API', async () => {
       await session.close();
       await mock.close();
     }
+  }
+});
+
+test('search_messages reads one page and does not mark it read', async () => {
+  const id = '00000000-0000-4000-8000-000000000010';
+  const mock = await startMock((request) => {
+    expect(request.method).toBe('GET');
+    expect(request.authorization).toBe(`Bearer ${TOKEN}`);
+    expect(request.pathname).toBe('/messages/search');
+    return {
+      status: 200,
+      json: {
+        messages: [{ ...message(id), readAt: null }],
+        next: SEARCH_CURSOR,
+      },
+    };
+  });
+  const session = await connect(mock.url);
+  try {
+    const defaults = await callTool(session.client, 'search_messages');
+    expect(defaults.isError).toBe(false);
+    expect(defaults.value).toEqual({
+      messages: [{ ...message(id), readAt: null }],
+      next: SEARCH_CURSOR,
+    });
+    const filtered = await callTool(session.client, 'search_messages', {
+      status: 'all',
+      box: 'sent',
+      from: 'Beta',
+      since: '2024-01-01T00:00:00.000Z',
+      until: '2024-02-01T00:00:00+00:00',
+      text: '100%_\\',
+      limit: 2,
+      cursor: SEARCH_CURSOR,
+    });
+    expect(filtered.isError).toBe(false);
+    expect(mock.requests).toHaveLength(2);
+    expect(mock.requests.map((request) => request.pathname)).toEqual([
+      '/messages/search',
+      '/messages/search',
+    ]);
+    const defaultQuery = new URLSearchParams(mock.requests[0]?.search);
+    expect(defaultQuery.get('status')).toBe('unread');
+    expect(defaultQuery.get('box')).toBe('received');
+    expect(defaultQuery.get('text')).toBeNull();
+    const query = new URLSearchParams(mock.requests[1]?.search);
+    expect(query.get('status')).toBe('all');
+    expect(query.get('box')).toBe('sent');
+    expect(query.get('from')).toBe('Beta');
+    expect(query.get('since')).toBe('2024-01-01T00:00:00.000Z');
+    expect(query.get('until')).toBe('2024-02-01T00:00:00+00:00');
+    expect(query.get('text')).toBe('100%_\\');
+    expect(query.get('limit')).toBe('2');
+    expect(query.get('cursor')).toBe(SEARCH_CURSOR);
+  } finally {
+    await session.close();
+    await mock.close();
+  }
+});
+
+test('search_messages surfaces a bad cursor as invalid request', async () => {
+  const mock = await startMock(() => ({
+    status: 400,
+    json: { error: 'invalid request' },
+  }));
+  const session = await connect(mock.url);
+  try {
+    const result = await callTool(session.client, 'search_messages', {
+      cursor: SEARCH_CURSOR,
+    });
+    expect(result.isError).toBe(true);
+    expect(apiError(result.text)).toEqual({
+      error: 'invalid request',
+      status: 400,
+    });
+    expect(mock.requests.map((request) => request.pathname)).toEqual([
+      '/messages/search',
+    ]);
+  } finally {
+    await session.close();
+    await mock.close();
   }
 });
 

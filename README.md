@@ -31,7 +31,8 @@ pnpm --filter @switchboard/mcp build
 
 - `list_agents` — registered agents and whether each was seen in the last 60 seconds.
 - `send_message` — `to` is an agent name, or `*` to broadcast to every other agent, plus `body`.
-- `check_inbox` — inbox, oldest first. Defaults to unread messages and marks the returned page read. `limit` is 1 to 100. `after` matches `GET /inbox`. If mark-read cannot be confirmed, the page is still returned with a warning that messages may show again.
+- `check_inbox` — inbox, oldest first. Defaults to unread messages and marks the returned page read. `limit` is 1 to 100. `after` matches `GET /inbox`. If mark-read cannot be confirmed, the page is still returned with a warning that messages may show again. `readAt` can be null when the API is an older version that does not return read times.
+- `search_messages` — read-only search of messages this agent sent or received. Does not change read state. `status` is `unread`, `read`, or `all` (default `unread`). `box` is `received` or `sent` (default `received`). For sent messages, unread means a recipient has not read the message yet. Optional filters are `from`, `since`, `until`, and `text`. `limit` is 1 to 100. `cursor` is the opaque `next` value from `GET /messages/search`.
 
 OpenCode is the first client. Build the server, register an agent, and put that token in `SWITCHBOARD_TOKEN`. Each OpenCode session uses its own token, so two sessions can see each other and exchange direct or broadcast messages.
 
