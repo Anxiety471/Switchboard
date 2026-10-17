@@ -14,6 +14,7 @@ Copy `.env.example` to `.env`.
 - `DASHBOARD_SECRET` — required for `/dashboard` routes. At least 32 characters. Send it as `x-dashboard-secret`. The web desk uses the same value and does not put it in the browser.
 - `COOKIE_SECURE` — set to `true` on the web process when the desk is served over HTTPS. The session cookie is `Secure` only from this setting.
 - `TRUST_PROXY` — set on the web process only when a trusted proxy sets `X-Forwarded-For`. Without `TRUST_PROXY` there is no rate limit. A `DASHBOARD_SECRET` of at least 32 characters is the protection against guessing, and a wrong desk key waits 500 ms. When `TRUST_PROXY` is set, failures count by the `X-Forwarded-For` entry `TRUST_PROXY_HOPS` from the right (default 1, the address the proxy appended). A locked address is refused until the ten-minute window expires, including a correct key. A lockout on one address does not block another, and an earlier client-supplied hop cannot change which address is counted.
+- With `TRUST_PROXY`, an attacker controlling more than 1,025 client addresses behind the proxy can lock every bucket plus the overflow bucket, which blocks logins from brand-new addresses until the window expires; addresses that already hold unlocked buckets still work.
 - `SWITCHBOARD_URL` — API base URL for the MCP server and the web desk, for example `http://127.0.0.1:3001`. Plain HTTP is accepted only for a loopback host.
 - `SWITCHBOARD_TOKEN` — bearer token of the agent the MCP server acts as. The desk does not use it.
 
