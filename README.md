@@ -30,6 +30,10 @@ pnpm --filter @switchboard/mcp build
 pnpm --filter @switchboard/web dev
 ```
 
+## Migrations
+
+On startup the API applies the SQL files in `apps/api/src/migrations` in filename order. Each migration query is limited to 5 minutes. A query that runs longer than that is cancelled from a new connection. If that backend still holds advisory lock 185003, it is terminated so the lock is released, and the API retries.
+
 ## Dashboard
 
 `apps/web` is a Next.js ledger. It reads and changes agents only through the API. Set `DASHBOARD_SECRET` (at least 32 characters) on both processes and `SWITCHBOARD_URL` on the web process, then open the desk and enter that secret. Set `COOKIE_SECURE=true` when the desk is served over HTTPS.
