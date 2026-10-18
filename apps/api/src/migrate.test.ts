@@ -110,6 +110,7 @@ test('a timed-out migration destroys the client instead of resetting', async () 
         `SELECT pid
          FROM pg_stat_activity
          WHERE pid <> pg_backend_pid()
+           AND datname = current_database()
            AND query LIKE '%pg_sleep(30)%'`,
       )
       .catch(() => undefined);
@@ -124,6 +125,7 @@ test('a timed-out migration destroys the client instead of resetting', async () 
           `SELECT 1
            FROM pg_stat_activity
            WHERE pid <> pg_backend_pid()
+             AND datname = current_database()
              AND query LIKE '%pg_sleep(30)%'`,
         )
         .catch(() => undefined);
@@ -137,6 +139,108 @@ test('a timed-out migration destroys the client instead of resetting', async () 
     await rm(directory, { recursive: true, force: true });
   }
 }, 15_000);
+
+test('a stuck migration backend is cancelled, the lock is freed, and the next attempt succeeds', async () => {
+  const pool = new Pool({
+    connectionString: databaseUrl,
+    statement_timeout: 2000,
+    query_timeout: 2500,
+    max: 1,
+  });
+  pool.on('error', () => undefined);
+  const directory = await mkdtemp(join(tmpdir(), 'switchboard-migrate-'));
+  const version = `900_stuck_${Date.now()}.sql`;
+  await writeFile(join(directory, version), 'SELECT pg_sleep(30)');
+  const nextDirectory = await mkdtemp(join(tmpdir(), 'switchboard-migrate-'));
+  const nextVersion = `900_next_${Date.now()}.sql`;
+  await writeFile(join(nextDirectory, nextVersion), 'SELECT 1');
+  const admin = new Client({
+    connectionString: databaseUrl,
+    statement_timeout: 2000,
+  });
+  admin.on('error', () => undefined);
+  await admin.connect();
+  const timeoutMs = 3000;
+  const pending = migrate(pool, directory, timeoutMs);
+  let stuckPid: number | undefined;
+  try {
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const found = await admin.query<{ pid: number }>(
+        `SELECT pid
+         FROM pg_stat_activity
+         WHERE pid <> pg_backend_pid()
+           AND datname = current_database()
+           AND query LIKE '%pg_sleep(30)%'`,
+      );
+      const pid = found.rows[0]?.pid;
+      if (pid !== undefined) {
+        stuckPid = pid;
+        break;
+      }
+      await delay(50);
+    }
+    if (stuckPid === undefined) {
+      throw new Error('expected a stuck migration backend');
+    }
+    const held = await admin.query(
+      `SELECT 1
+       FROM pg_locks
+       WHERE locktype = 'advisory'
+         AND classid = 0
+         AND objid = 185003
+         AND objsubid = 1
+         AND granted
+         AND pid = $1
+         AND database = (
+           SELECT oid FROM pg_database WHERE datname = current_database()
+         )`,
+      [stuckPid],
+    );
+    expect(held.rowCount).toBe(1);
+
+    await expect(pending).rejects.toThrow(/Query read timeout/);
+
+    const activity = await admin.query(
+      'SELECT 1 FROM pg_stat_activity WHERE pid = $1',
+      [stuckPid],
+    );
+    expect(activity.rowCount).toBe(0);
+    const lock = await admin.query(
+      `SELECT 1
+       FROM pg_locks
+       WHERE locktype = 'advisory'
+         AND classid = 0
+         AND objid = 185003
+         AND objsubid = 1
+         AND granted
+         AND database = (
+           SELECT oid FROM pg_database WHERE datname = current_database()
+         )`,
+    );
+    expect(lock.rowCount).toBe(0);
+
+    const started = Date.now();
+    await migrate(pool, nextDirectory);
+    expect(Date.now() - started).toBeLessThan(2000);
+  } finally {
+    await admin
+      .query(
+        `SELECT pg_terminate_backend(pid)
+         FROM pg_stat_activity
+         WHERE pid <> pg_backend_pid()
+           AND datname = current_database()
+           AND query LIKE '%pg_sleep(30)%'`,
+      )
+      .catch(() => undefined);
+    await pool
+      .query('DELETE FROM schema_migrations WHERE version = $1', [nextVersion])
+      .catch(() => undefined);
+    await admin.end().catch(() => undefined);
+    await pool.end().catch(() => undefined);
+    await rm(directory, { recursive: true, force: true });
+    await rm(nextDirectory, { recursive: true, force: true });
+  }
+}, 20_000);
 
 test('an upgrade renames case-variant agent names before the unique index', async () => {
   const caseUrl = databaseUrlFor('switchboard_case_test');
