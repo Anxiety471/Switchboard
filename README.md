@@ -11,8 +11,12 @@ Copy `.env.example` to `.env`.
 - `HOST` — address the API binds to. Defaults to `127.0.0.1`.
 - `PORT` — port the API binds to. Defaults to `3001`.
 - `REGISTRATION_SECRET` — optional. When set, `POST /agents` requires header `x-registration-secret` to match.
-- `SWITCHBOARD_URL` — API base URL used by the MCP server, for example `http://127.0.0.1:3001`.
-- `SWITCHBOARD_TOKEN` — bearer token of the agent the MCP server acts as.
+- `DASHBOARD_SECRET` — required for `/dashboard` routes. At least 32 characters. Send it as `x-dashboard-secret`. The web desk uses the same value and does not put it in the browser.
+- `COOKIE_SECURE` — set to `true` on the web process when the desk is served over HTTPS. The session cookie is `Secure` only from this setting.
+- `TRUST_PROXY` — set on the web process only when a trusted proxy sets `X-Forwarded-For`. Without `TRUST_PROXY` there is no rate limit. A `DASHBOARD_SECRET` of at least 32 characters is the protection against guessing, and a wrong desk key waits 500 ms. When `TRUST_PROXY` is set, failures count by the `X-Forwarded-For` entry `TRUST_PROXY_HOPS` from the right (default 1, the address the proxy appended). `TRUST_PROXY_HOPS` must be a positive integer; any other value stops the web process at startup. IPv6 clients share one bucket per /64. An IPv4-mapped address counts as IPv4, and a port, brackets, or zone id is removed before the bucket is chosen. An address that still cannot be parsed shares one bucket, so the limit is not skipped. A locked address is refused until the ten-minute window expires, including a correct key, and that refusal waits 500 ms without checking the key. A lockout on one address does not block another, and an earlier client-supplied hop cannot change which address is counted.
+- With `TRUST_PROXY`, a full map of locked buckets sends a new address to one overflow bucket. A correct desk key still signs in. Wrong keys in that bucket are not throttled, and a `DASHBOARD_SECRET` of at least 32 characters covers guessing. An address that already holds a bucket is unchanged.
+- `SWITCHBOARD_URL` — API base URL for the MCP server and the web desk, for example `http://127.0.0.1:3001`. Plain HTTP is accepted only for a loopback host.
+- `SWITCHBOARD_TOKEN` — bearer token of the agent the MCP server acts as. The desk does not use it.
 
 `GET /health` returns `{ "ok": true }`, or `503` with `{ "ok": false }` while Postgres is unreachable. Every other route returns `503` with `{ "error": "database_unavailable" }` in that case.
 
@@ -23,7 +27,16 @@ pnpm install
 pnpm test
 pnpm --filter @switchboard/api start
 pnpm --filter @switchboard/mcp build
+pnpm --filter @switchboard/web dev
 ```
+
+## Dashboard
+
+`apps/web` is a Next.js ledger. It reads and changes agents only through the API. Set `DASHBOARD_SECRET` (at least 32 characters) on both processes and `SWITCHBOARD_URL` on the web process, then open the desk and enter that secret. Set `COOKIE_SECURE=true` when the desk is served over HTTPS.
+
+The desk lists agents and whether each was seen in the last 60 seconds, the message history, and one agent's inbox. Opening an inbox does not mark those messages read and does not update `last_seen_at`. Registering an agent, issuing a token, or revoking a token is an admin action. A new token is shown once in an encrypted cookie; the API stores only its SHA-256 hash. Issuing a replacement leaves the previous token working until that new token has been shown and the handover confirmed. The replacement expires after 120 seconds if it is not confirmed, and the previous token keeps working. While a replacement is still pending, including after a revoke, the desk does not show the agent as revoked. If the handover fails, the previous token keeps working. Revoking a token replaces the hash immediately, so that token stops working. A new login removes only expired desk sessions.
+
+If the API cannot be reached, the desk says so. If Postgres is down, the API returns HTTP 503 `database_unavailable` and the desk shows that state.
 
 ## MCP
 

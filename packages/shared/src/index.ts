@@ -13,6 +13,21 @@ export type AgentSummary = {
   lastSeenAt: string | null;
 };
 
+export type DashboardAgent = {
+  id: AgentId;
+  name: string;
+  online: boolean;
+  lastSeenAt: string | null;
+  createdAt: string;
+  tokenRevoked: boolean;
+};
+
+export type RevokedAgent = {
+  id: AgentId;
+  name: string;
+  tokenRevoked: true;
+};
+
 export type SentMessage = {
   id: string;
 };
@@ -39,4 +54,17 @@ export type MarkedRead = {
 export type ReadReceipt = {
   read: string[];
   marked: MarkedRead[];
+};
+
+export type HistoryMessage = {
+  id: string;
+  from: string;
+  to: string;
+  body: string;
+  createdAt: string;
+};
+
+export type HistoryPage = {
+  messages: HistoryMessage[];
+  next: string | null;
 };

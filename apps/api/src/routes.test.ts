@@ -104,6 +104,8 @@ test('migration creates agents, messages, and per-recipient receipts', async () 
   );
   expect(tables.rows.map((row) => row.table_name)).toEqual([
     'agents',
+    'dashboard_notices',
+    'dashboard_sessions',
     'message_receipts',
     'messages',
     'schema_migrations',
@@ -124,7 +126,10 @@ test('migration creates agents, messages, and per-recipient receipts', async () 
     { table_name: 'agents', column_name: 'id' },
     { table_name: 'agents', column_name: 'last_seen_at' },
     { table_name: 'agents', column_name: 'name' },
+    { table_name: 'agents', column_name: 'pending_expires_at' },
+    { table_name: 'agents', column_name: 'pending_token_hash' },
     { table_name: 'agents', column_name: 'token_hash' },
+    { table_name: 'agents', column_name: 'token_revoked' },
     { table_name: 'messages', column_name: 'body' },
     { table_name: 'messages', column_name: 'created_at' },
     { table_name: 'messages', column_name: 'from_agent' },
@@ -264,13 +269,57 @@ test('missing token is unauthorized on protected routes', async () => {
     { method: 'GET' as const, url: '/inbox' },
     { method: 'GET' as const, url: '/inbox?unread=true' },
     { method: 'POST' as const, url: '/inbox/read', payload: { ids: [] } },
-    { method: 'GET' as const, url: '/missing' },
+    { method: 'GET' as const, url: '/dashboard/agents' },
+    { method: 'GET' as const, url: '/dashboard/messages' },
+    {
+      method: 'GET' as const,
+      url: '/dashboard/agents/00000000-0000-4000-8000-000000000001/inbox',
+    },
+    {
+      method: 'POST' as const,
+      url: '/dashboard/agents',
+      payload: { name: 'alpha' },
+    },
+    {
+      method: 'POST' as const,
+      url: '/dashboard/agents/00000000-0000-4000-8000-000000000001/token',
+    },
+    {
+      method: 'POST' as const,
+      url: '/dashboard/agents/00000000-0000-4000-8000-000000000001/token/revoke',
+    },
+    {
+      method: 'POST' as const,
+      url: '/dashboard/agents/00000000-0000-4000-8000-000000000001/token/confirm',
+    },
+    {
+      method: 'POST' as const,
+      url: '/dashboard/agents/00000000-0000-4000-8000-000000000001/token/discard',
+    },
+    { method: 'POST' as const, url: '/dashboard/sessions' },
+    {
+      method: 'GET' as const,
+      url: `/dashboard/sessions/${'a'.repeat(43)}`,
+    },
+    {
+      method: 'DELETE' as const,
+      url: `/dashboard/sessions/${'a'.repeat(43)}`,
+    },
+    {
+      method: 'POST' as const,
+      url: `/dashboard/sessions/${'a'.repeat(43)}/notices`,
+      payload: { type: 'failure', failure: 'unauthorized' },
+    },
   ];
   for (const route of cases) {
     const response = await app.inject(route);
     expect(response.statusCode, route.url).toBe(401);
     expect(response.json()).toEqual({ error: 'unauthorized' });
   }
+
+  const missing = await app.inject({ method: 'GET', url: '/missing' });
+  expect(missing.statusCode).toBe(404);
+  expect(missing.json()).toEqual({ error: 'not found' });
 
   const malformed = ['Token abc', 'Bearer', 'Bearer ', 'bearer not base64!'];
   for (const authorization of malformed) {
