@@ -293,6 +293,13 @@ test('an upgrade renames case-variant agent names before the unique index', asyn
          AND indexname = 'agents_name_lower_idx'`,
     );
     expect(index.rowCount).toBe(1);
+    const sentIndex = await setup.query(
+      `SELECT 1
+       FROM pg_indexes
+       WHERE schemaname = 'public'
+         AND indexname = 'messages_from_agent_created_at_id_idx'`,
+    );
+    expect(sentIndex.rowCount).toBe(1);
 
     await app.migrationsReady;
     const health = await app.inject({ method: 'GET', url: '/health' });

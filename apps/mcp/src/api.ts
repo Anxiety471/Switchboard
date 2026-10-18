@@ -46,6 +46,9 @@ export function mapApiError(status: number, body: unknown): SwitchboardError {
   if (status === 400 || status === 413) {
     return new SwitchboardError(status, 'invalid request');
   }
+  if (status === 414 || status === 431) {
+    return new SwitchboardError(status, 'request too large');
+  }
   if (status === 404) {
     return new SwitchboardError(status, 'not found');
   }
@@ -65,6 +68,17 @@ type InboxQuery = {
   unread: boolean;
   limit?: number;
   after?: string;
+};
+
+type SearchQuery = {
+  status: 'unread' | 'read' | 'all';
+  box: 'received' | 'sent';
+  from?: string;
+  since?: string;
+  until?: string;
+  text?: string;
+  limit?: number;
+  cursor?: string;
 };
 
 export type CheckedInbox = {
@@ -127,6 +141,34 @@ export class SwitchboardClient {
       };
     }
     return withReadTimes(page, receipt);
+  }
+
+  searchMessages(input: SearchQuery): Promise<InboxPage> {
+    const query: Record<string, string> = {
+      status: input.status,
+      box: input.box,
+    };
+    if (input.from !== undefined) {
+      query.from = input.from;
+    }
+    if (input.since !== undefined) {
+      query.since = input.since;
+    }
+    if (input.until !== undefined) {
+      query.until = input.until;
+    }
+    if (input.text !== undefined) {
+      query.text = input.text;
+    }
+    if (input.limit !== undefined) {
+      query.limit = String(input.limit);
+    }
+    if (input.cursor !== undefined) {
+      query.cursor = input.cursor;
+    }
+    return this.request('/messages/search', { method: 'GET', query }).then(
+      (body) => parseInbox(body),
+    );
   }
 
   private async markRead(ids: string[]): Promise<ReadReceipt | undefined> {

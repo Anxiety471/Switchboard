@@ -38,6 +38,37 @@ jobs:
           node-version-file: .nvmrc
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Build API and MCP from a clean checkout
+        run: |
+          set -euo pipefail
+          test ! -e packages/shared/dist
+          pnpm --filter @switchboard/mcp build
+          test -f packages/shared/dist/index.js
+          test -f apps/mcp/dist/index.js
+          set +e
+          timeout 20s node apps/mcp/dist/index.js > /tmp/mcp-start.txt 2>&1
+          code=$?
+          set -e
+          if grep -q ERR_MODULE_NOT_FOUND /tmp/mcp-start.txt; then
+            cat /tmp/mcp-start.txt
+            exit 1
+          fi
+          test "$code" -ne 0
+          grep -q 'SWITCHBOARD_URL is required' /tmp/mcp-start.txt
+          rm -rf packages/shared/dist apps/api/dist apps/mcp/dist
+          pnpm --filter @switchboard/api build
+          test -f packages/shared/dist/index.js
+          test -f apps/api/dist/index.js
+          set +e
+          timeout 20s env -u DATABASE_URL node apps/api/dist/index.js > /tmp/api-start.txt 2>&1
+          code=$?
+          set -e
+          if grep -q ERR_MODULE_NOT_FOUND /tmp/api-start.txt; then
+            cat /tmp/api-start.txt
+            exit 1
+          fi
+          test "$code" -ne 0
+          grep -q 'DATABASE_URL is required' /tmp/api-start.txt
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test

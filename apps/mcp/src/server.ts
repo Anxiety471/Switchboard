@@ -1,4 +1,10 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import {
+  MAX_SEARCH_TEXT_BYTES,
+  parseFilterTime,
+  parseInboxCursor,
+  parseSearchCursor,
+} from '@switchboard/shared';
 import { z } from 'zod';
 import { SwitchboardClient, SwitchboardError } from './api.js';
 import type { SwitchboardClientOptions } from './api.js';
@@ -6,21 +12,19 @@ import type { SwitchboardClientOptions } from './api.js';
 // Client-side checks give friendlier errors and mirror the API limits.
 const RECIPIENT = /^(?:\*|[A-Za-z0-9][A-Za-z0-9_-]{0,63})$/;
 const MAX_BODY_BYTES = 8192;
-const CURSOR =
-  /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+const AGENT_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 
 function validCursor(value: string): boolean {
-  const match = CURSOR.exec(value);
-  const createdAt = match?.[1];
-  if (createdAt === undefined) {
-    return false;
-  }
-  const year = Number(createdAt.slice(0, 4));
-  if (!Number.isInteger(year) || year < 1 || year > 9999) {
-    return false;
-  }
-  const parsed = new Date(createdAt);
-  return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === createdAt;
+  return parseInboxCursor(value) !== undefined;
+}
+
+function validSearchCursor(value: string): boolean {
+  return parseSearchCursor(value) !== undefined;
+}
+
+function validFilterTime(value: string): boolean {
+  return parseFilterTime(value) !== undefined;
 }
 
 function messageBody() {
@@ -79,7 +83,7 @@ export function createMcpServer(options: SwitchboardClientOptions): McpServer {
     { name: 'switchboard', version: '0.0.0' },
     {
       instructions:
-        'Switchboard tools use the agent token in this process. list_agents shows registered agents, send_message sends to one agent or broadcasts with *, and check_inbox reads this inbox and marks the returned page read. If mark-read cannot be confirmed, check_inbox still returns that page with a warning.',
+        'Switchboard tools use the agent token in this process. list_agents shows registered agents, send_message sends to one agent or broadcasts with *, check_inbox reads this inbox and marks the returned page read, and search_messages searches received and sent messages without marking them read. If mark-read cannot be confirmed, check_inbox still returns that page with a warning.',
     },
   );
 
@@ -129,7 +133,7 @@ export function createMcpServer(options: SwitchboardClientOptions): McpServer {
     {
       title: 'Check inbox',
       description:
-        'Read this inbox, oldest first. Defaults to unread messages and marks the returned page as read. Pass next as after to read another page. If mark-read cannot be confirmed, the page is still returned with a warning and messages may show again.',
+        'Read this inbox, oldest first. Defaults to unread messages and marks the returned page as read. Pass next as after to read another page. If mark-read cannot be confirmed, the page is still returned with a warning and messages may show again. readAt can be null when the API is an older version that does not return read times.',
       inputSchema: {
         unread: z
           .boolean()
@@ -161,6 +165,88 @@ export function createMcpServer(options: SwitchboardClientOptions): McpServer {
           next: page.next,
           read: page.read,
           ...(page.warning !== undefined ? { warning: page.warning } : {}),
+        });
+      } catch (error) {
+        return toolFailure(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    'search_messages',
+    {
+      title: 'Search messages',
+      description:
+        'Search messages this agent sent or received, oldest first. Does not mark messages read. status is unread, read, or all (default unread). box is received or sent (default received). For sent messages, unread means a recipient has not read the message yet. Pass next as cursor to read another page.',
+      inputSchema: {
+        status: z
+          .enum(['unread', 'read', 'all'])
+          .default('unread')
+          .describe('unread, read, or all. Defaults to unread'),
+        from: z
+          .string()
+          .regex(AGENT_NAME, 'invalid agent name')
+          .optional()
+          .describe('Only messages sent by this agent name. Case-insensitive'),
+        since: z
+          .string()
+          .refine(validFilterTime, 'invalid time')
+          .optional()
+          .describe('Include messages created at or after this time'),
+        until: z
+          .string()
+          .refine(validFilterTime, 'invalid time')
+          .optional()
+          .describe('Include messages created at or before this time'),
+        text: z
+          .string()
+          .min(1)
+          .max(MAX_SEARCH_TEXT_BYTES)
+          .refine(
+            (value) =>
+              !value.includes('\0') &&
+              Buffer.byteLength(value, 'utf8') <= MAX_SEARCH_TEXT_BYTES,
+            {
+              message: `text must be 1 to ${MAX_SEARCH_TEXT_BYTES} bytes and must not contain NUL`,
+            },
+          )
+          .optional()
+          .describe(
+            `Case-insensitive body match. Percent, underscore, and backslash are literal. At most ${MAX_SEARCH_TEXT_BYTES} bytes`,
+          ),
+        box: z
+          .enum(['received', 'sent'])
+          .default('received')
+          .describe('received or sent. Defaults to received'),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(100)
+          .optional()
+          .describe('Page size from 1 to 100'),
+        cursor: z
+          .string()
+          .refine(validSearchCursor, 'invalid cursor')
+          .optional()
+          .describe('Opaque cursor from the previous page next field'),
+      },
+    },
+    async ({ status, from, since, until, text, box, limit, cursor }) => {
+      try {
+        const page = await client.searchMessages({
+          status,
+          box,
+          ...(from !== undefined ? { from } : {}),
+          ...(since !== undefined ? { since } : {}),
+          ...(until !== undefined ? { until } : {}),
+          ...(text !== undefined ? { text } : {}),
+          ...(limit !== undefined ? { limit } : {}),
+          ...(cursor !== undefined ? { cursor } : {}),
+        });
+        return jsonResult({
+          messages: page.messages,
+          next: page.next,
         });
       } catch (error) {
         return toolFailure(error);

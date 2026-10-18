@@ -244,6 +244,138 @@ test('check_inbox follows the API cursor and marks each page read', async () => 
   }
 });
 
+test('search_messages is read-only and cannot see another agent', async () => {
+  const alpha = await register('alpha');
+  const beta = await register('beta');
+  const gamma = await register('gamma');
+  const alphaSession = await connect(alpha.token);
+  const betaSession = await connect(beta.token);
+  const gammaSession = await connect(gamma.token);
+  try {
+    const first = await callTool(alphaSession.client, 'send_message', {
+      to: 'beta',
+      body: '100% secret',
+    });
+    const second = await callTool(alphaSession.client, 'send_message', {
+      to: 'beta',
+      body: 'plain secret',
+    });
+    const firstId = idOf(first.value);
+    const secondId = idOf(second.value);
+    await database().query(
+      'UPDATE messages SET created_at = $2 WHERE id = $1',
+      [firstId, '2024-01-01T00:00:00.000Z'],
+    );
+    await database().query(
+      'UPDATE messages SET created_at = $2 WHERE id = $1',
+      [secondId, '2024-01-02T00:00:00.000Z'],
+    );
+
+    const literal = await callTool(betaSession.client, 'search_messages', {
+      text: '%',
+      status: 'all',
+    });
+    expect(literal.isError).toBe(false);
+    expect(literal.value).toMatchObject({
+      messages: [
+        expect.objectContaining({
+          id: firstId,
+          body: '100% secret',
+          readAt: null,
+        }),
+      ],
+      next: null,
+    });
+    const opened = await callTool(betaSession.client, 'search_messages', {
+      status: 'all',
+      limit: 1,
+    });
+    expect(opened.isError).toBe(false);
+    const page = opened.value as {
+      messages: { id: string; body: string; readAt: string | null }[];
+      next: string | null;
+    };
+    expect(page.messages).toEqual([
+      expect.objectContaining({
+        id: firstId,
+        body: '100% secret',
+        readAt: null,
+      }),
+    ]);
+    if (page.next === null) {
+      throw new Error('expected a cursor');
+    }
+    const stored = await database().query<{ read_at: Date | null }>(
+      `SELECT read_at
+       FROM message_receipts
+       WHERE agent_id = $1
+       ORDER BY message_id`,
+      [beta.id],
+    );
+    expect(stored.rows).toHaveLength(2);
+    expect(stored.rows.every((row) => row.read_at === null)).toBe(true);
+
+    const rest = await callTool(betaSession.client, 'search_messages', {
+      status: 'all',
+      cursor: page.next,
+    });
+    expect(rest.isError).toBe(false);
+    expect(rest.value).toMatchObject({
+      messages: [{ id: secondId, body: 'plain secret', readAt: null }],
+      next: null,
+    });
+
+    const hidden = await callTool(gammaSession.client, 'search_messages', {
+      status: 'all',
+      box: 'received',
+      text: 'secret',
+    });
+    expect(hidden.isError).toBe(false);
+    expect(hidden.value).toEqual({ messages: [], next: null });
+    expect(hidden.text).not.toContain('secret');
+    expect(hidden.text).not.toContain(firstId);
+    const hiddenSent = await callTool(gammaSession.client, 'search_messages', {
+      status: 'all',
+      box: 'sent',
+      text: 'secret',
+    });
+    expect(hiddenSent.value).toEqual({ messages: [], next: null });
+
+    const foreign = await callTool(gammaSession.client, 'search_messages', {
+      status: 'all',
+      cursor: page.next,
+    });
+    expect(foreign.isError).toBe(true);
+    expect(JSON.parse(foreign.text)).toEqual({
+      error: 'invalid request',
+      status: 400,
+    });
+    expect(foreign.text).not.toContain('secret');
+
+    const sent = await callTool(alphaSession.client, 'search_messages', {
+      box: 'sent',
+      status: 'unread',
+      text: '%',
+    });
+    expect(sent.isError).toBe(false);
+    expect(sent.value).toMatchObject({
+      messages: [{ id: firstId, readAt: null }],
+      next: null,
+    });
+
+    const inbox = await callTool(betaSession.client, 'check_inbox');
+    expect(inbox.isError).toBe(false);
+    expect(inbox.value).toMatchObject({
+      messages: [{ id: firstId }, { id: secondId }],
+      read: [firstId, secondId],
+    });
+  } finally {
+    await alphaSession.close();
+    await betaSession.close();
+    await gammaSession.close();
+  }
+});
+
 test('check_inbox returns the page when mark-read commits and the response is dropped', async () => {
   const alpha = await register('alpha');
   const beta = await register('beta');

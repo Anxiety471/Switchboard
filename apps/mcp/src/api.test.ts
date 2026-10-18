@@ -22,6 +22,16 @@ test('maps API error statuses onto stable messages', () => {
     status: 413,
     message: 'invalid request',
   });
+  expect(mapApiError(414, '<html>URI Too Long</html>')).toMatchObject({
+    status: 414,
+    message: 'request too large',
+  });
+  expect(
+    mapApiError(431, { error: '<html>Request Header Fields Too Large</html>' }),
+  ).toMatchObject({
+    status: 431,
+    message: 'request too large',
+  });
   expect(mapApiError(500, { error: 'internal error' })).toMatchObject({
     status: 500,
     message: 'internal error',
@@ -39,6 +49,8 @@ test('drops API error text that is not a known message', () => {
     mapApiError(401, { error: secret }),
     mapApiError(503, `<html>${secret}</html>`),
     mapApiError(503, { error: { detail: secret } }),
+    mapApiError(431, `<html>${secret}</html>`),
+    mapApiError(414, { error: secret }),
   ];
   for (const error of mapped) {
     expect(error.message).not.toContain(secret);
@@ -49,5 +61,7 @@ test('drops API error text that is not a known message', () => {
     'unauthorized',
     'database_unavailable',
     'database_unavailable',
+    'request too large',
+    'request too large',
   ]);
 });

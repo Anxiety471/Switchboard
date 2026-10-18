@@ -9,8 +9,8 @@
   "scripts": {
     "lint": "eslint . && prettier --check .",
     "typecheck": "pnpm --filter \"./apps/*\" --filter \"./packages/*\" typecheck",
-    "test": "pnpm --filter \"./apps/*\" --filter \"./packages/*\" test",
-    "build": "pnpm --filter \"./apps/*\" --filter \"./packages/*\" build"
+    "test": "pnpm --filter @switchboard/shared build && pnpm --filter \"./apps/api\" --filter \"./apps/web\" --filter \"./packages/*\" test && pnpm --filter @switchboard/mcp test",
+    "build": "pnpm --filter \"./apps/web\" --filter \"./packages/*\" build && pnpm --filter @switchboard/api build && pnpm --filter @switchboard/mcp build"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
